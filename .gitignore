@@ -1,0 +1,55 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# Build output
+/bitcache
+/cmd/bitcache/bitcache
+
+# Test data directories
+/tmp/
+/testdata/*/
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS specific
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Temporary files
+*.tmp
+*.log
+
+# Database files created during testing or development
+*.db
+*.data
+*.log
+/data/
+/db/
+
+# Benchmarking results
+*.bench
+cpu.prof
+mem.prof
+trace.out
