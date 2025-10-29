@@ -4,23 +4,25 @@ A simple, fast persistent cache in Go library, inspired by the Bitcask design.
 
 ## Features
 
-- **Fast**: O(1) lookups with in-memory index
+- **Fast**: O(log n) lookups with in-memory B-tree index
 - **Memory Cache Layer**: Optional high-performance read-through cache with bounded memory
 - **Reliable**: CRC32 checksums for data integrity
 - **Crash-safe**: Hint files enable fast recovery
-- **Efficient**: Automatic compaction reclaims disk space
-- **Concurrent**: Lock-free reads via atomic radix tree
+- **LSM-Style Compaction**: Multi-level compaction for efficient storage organization
+- **Garbage Collection**: Periodic GC to reclaim space from dead data
+- **Concurrent**: Lock-free reads via atomic B-tree
 - **Zero GC Overhead**: Memory cache uses arenas to eliminate GC pressure
 - **Simple**: Clean API with minimal dependencies
 
 ## Design
 
-BitCache uses a log-structured storage approach inspired by Bitcask:
+BitCache uses a log-structured storage approach inspired by Bitcask with LSM-tree enhancements:
 
 - **Append-only log**: All writes go sequentially to an active segment file. When it reaches the size threshold, it's rotated and a new segment is created.
-- **In-memory index**: An immutable radix tree maps every key to its disk location, enabling O(1) lookups and efficient prefix scans.
+- **In-memory index**: A B-tree maps every key to its disk location, enabling O(log n) lookups and efficient sorted iteration.
+- **LSM-style multi-level compaction**: Segments are organized into levels (L0-L4). As segments accumulate at lower levels, they're compacted into higher levels, reducing write amplification and improving read performance.
+- **Garbage collection**: Periodic GC scans segments for dead data (outdated or deleted entries) and rewrites only live entries, reclaiming disk space.
 - **Memory cache layer**: Optional read-through cache using sharded hash maps with LRU/LFU eviction and zero-GC memory arenas.
-- **Compaction**: Periodically rewrites only the latest value for each key, discarding obsolete versions and deleted entries to reclaim space.
 - **Crash recovery**: On startup, hint files (embedded segment indexes) allow rebuilding the key directory without scanning the entire log.
 
 ## Installation
@@ -307,11 +309,21 @@ go build
 # View statistics
 ./bitcache -d /tmp/mydb stats
 
-# Compact database
+# Compact database (automatic LSM or GC as needed)
 ./bitcache -d /tmp/mydb compact
 
-# Compact only oldest 5 segments
-./bitcache -d /tmp/mydb compact --count 5
+# List segments by level
+./bitcache -d /tmp/mydb compact --list
+
+# Perform garbage collection
+./bitcache -d /tmp/mydb compact --gc
+
+# Compact specific level
+./bitcache -d /tmp/mydb compact --level 0 --batch 4
+
+
+# Dry-run to see what would be compacted
+./bitcache -d /tmp/mydb compact --level 0 --dry-run
 ```
 
 ## Performance
@@ -598,7 +610,7 @@ These limitations make it unsuitable as a primary database for most applications
 
 ## Limitations
 
-- All keys must fit in memory (values are on disk) but leverages prefix tree compression
+- All keys must fit in memory (values are on disk) with efficient B-tree storage
 - Single writer (concurrent reads are supported)
 - No transactions or batch operations
 - No built-in replication or clustering
@@ -614,4 +626,4 @@ MIT License - see [LICENSE](LICENSE) file for details.
 ## Acknowledgments
 
 - Inspired by the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) paper
-- Uses [go-immutable-radix](https://github.com/hashicorp/go-immutable-radix) for the in-memory index
+- Uses [tidwall/btree](https://github.com/tidwall/btree) for the in-memory index

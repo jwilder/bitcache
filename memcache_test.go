@@ -2,7 +2,10 @@ package bitcache
 
 import (
 	"fmt"
+	"os"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestMemCache_BasicOperations(t *testing.T) {
@@ -1187,6 +1190,10 @@ func (m *mockCache) Stats() Stats {
 	return Stats{}
 }
 
+func (m *mockCache) CompactN(count int) error {
+	return nil // No-op
+}
+
 func (m *mockCache) Close() error {
 	return nil
 }
@@ -1346,5 +1353,416 @@ func BenchmarkMemCache_LFU_Eviction_PureMemory(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		key := keys[i%100]
 		_ = memCache.Set(key, value)
+	}
+}
+
+// Tests moved from memcache_stats_test.go
+
+func TestMemCacheStats(t *testing.T) {
+	// Create a backing cache
+	backing, err := NewDiskCache(t.TempDir())
+	if err != nil {
+		t.Fatalf("Failed to create backing cache: %v", err)
+	}
+	defer backing.Close()
+
+	// Create mem cache with small size to trigger evictions
+	mc, err := NewMemCache(backing, MemCacheConfig{
+		MaxMemoryBytes: 1024 * 10, // 10KB - small to trigger evictions
+		EvictionPolicy: EvictionLRU,
+		ShardCount:     4,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create mem cache: %v", err)
+	}
+	defer mc.Close()
+
+	fmt.Println("\n=== MemCache Stats Test ===")
+
+	// Phase 1: Write some data
+	fmt.Println("\nPhase 1: Writing 20 keys...")
+	for i := 0; i < 20; i++ {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		value := make([]byte, 200)
+		if err := mc.Set(key, value); err != nil {
+			t.Fatalf("Failed to set: %v", err)
+		}
+	}
+
+	// Phase 2: Read some keys (hits)
+	fmt.Println("\nPhase 2: Reading 10 keys (should be hits)...")
+	for i := 0; i < 10; i++ {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		if _, err := mc.Get(key); err != nil {
+			t.Fatalf("Failed to get: %v", err)
+		}
+	}
+
+	// Phase 3: Read non-existent keys (misses)
+	fmt.Println("\nPhase 3: Reading 5 non-existent keys (should be misses)...")
+	for i := 100; i < 105; i++ {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		mc.Get(key) // Ignore error
+	}
+
+	// Phase 4: Write more data to trigger forced evictions
+	fmt.Println("\nPhase 4: Writing 30 more keys (should trigger evictions)...")
+	for i := 20; i < 50; i++ {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		value := make([]byte, 200)
+		if err := mc.Set(key, value); err != nil {
+			t.Fatalf("Failed to set: %v", err)
+		}
+	}
+
+	// Phase 5: Delete some keys
+	fmt.Println("\nPhase 5: Deleting 5 keys...")
+	for i := 0; i < 5; i++ {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		mc.Delete(key)
+	}
+
+	// Get stats
+	stats := mc.MemStats()
+
+	fmt.Println("\n=== Final Statistics ===")
+	fmt.Printf("Entries: %d\n", stats.Entries)
+	fmt.Printf("Memory Used: %d bytes\n", stats.MemoryUsed)
+	fmt.Printf("Memory Limit: %d bytes\n", stats.MemoryLimit)
+	fmt.Printf("Utilization: %.1f%%\n", stats.Utilization*100)
+	fmt.Printf("\nCache Performance:\n")
+	fmt.Printf("  Hits: %d\n", stats.Hits)
+	fmt.Printf("  Misses: %d\n", stats.Misses)
+	fmt.Printf("  Hit Rate: %.1f%%\n", stats.HitRate*100)
+	fmt.Printf("  Forced Evictions: %d\n", stats.ForcedEvictions)
+	fmt.Printf("  Delete Evictions: %d\n", stats.DeleteEvictions)
+	fmt.Printf("  Eviction Rate: %.2f/sec\n", stats.EvictionRate)
+	fmt.Printf("  Avg Item Size: %d bytes\n", stats.AvgItemSize)
+
+	// Verify stats make sense
+	if stats.Hits < 5 {
+		t.Errorf("Expected at least 5 hits, got %d", stats.Hits)
+	}
+	if stats.Misses < 5 {
+		t.Errorf("Expected at least 5 misses, got %d", stats.Misses)
+	}
+	if stats.ForcedEvictions == 0 {
+		t.Errorf("Expected some forced evictions due to small cache size")
+	}
+	if stats.DeleteEvictions != 5 {
+		t.Errorf("Expected 5 delete evictions, got %d", stats.DeleteEvictions)
+	}
+	if stats.HitRate < 0 || stats.HitRate > 1 {
+		t.Errorf("Hit rate should be between 0 and 1, got %.2f", stats.HitRate)
+	}
+
+	fmt.Println("\n✓ All stats tests passed")
+}
+
+func TestMemCacheStatsReset(t *testing.T) {
+	backing, err := NewDiskCache(t.TempDir())
+	if err != nil {
+		t.Fatalf("Failed to create backing cache: %v", err)
+	}
+	defer backing.Close()
+
+	mc, err := NewMemCache(backing, MemCacheConfig{
+		MaxMemoryBytes: 1024 * 100,
+		EvictionPolicy: EvictionLRU,
+		ShardCount:     4,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create mem cache: %v", err)
+	}
+	defer mc.Close()
+
+	fmt.Println("\n=== MemCache Stats Reset Test ===")
+
+	// Generate some activity
+	fmt.Println("\nGenerating activity...")
+	for i := 0; i < 10; i++ {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		mc.Set(key, []byte("value"))
+		mc.Get(key)
+	}
+
+	stats1 := mc.MemStats()
+	fmt.Printf("Before reset: Hits=%d, Misses=%d\n", stats1.Hits, stats1.Misses)
+
+	if stats1.Hits == 0 {
+		t.Error("Expected some hits before reset")
+	}
+
+	// Reset stats
+	fmt.Println("\nResetting stats...")
+	mc.ResetStats()
+	time.Sleep(10 * time.Millisecond) // Small delay
+
+	stats2 := mc.MemStats()
+	fmt.Printf("After reset: Hits=%d, Misses=%d\n", stats2.Hits, stats2.Misses)
+
+	if stats2.Hits != 0 {
+		t.Errorf("Expected 0 hits after reset, got %d", stats2.Hits)
+	}
+	if stats2.Misses != 0 {
+		t.Errorf("Expected 0 misses after reset, got %d", stats2.Misses)
+	}
+	if stats2.ForcedEvictions != 0 {
+		t.Errorf("Expected 0 forced evictions after reset, got %d", stats2.ForcedEvictions)
+	}
+	if stats2.DeleteEvictions != 0 {
+		t.Errorf("Expected 0 delete evictions after reset, got %d", stats2.DeleteEvictions)
+	}
+
+	fmt.Println("\n✓ Stats reset test passed")
+}
+
+func TestMemCacheSizingDecisions(t *testing.T) {
+	backing, err := NewDiskCache(t.TempDir())
+	if err != nil {
+		t.Fatalf("Failed to create backing cache: %v", err)
+	}
+	defer backing.Close()
+
+	mc, err := NewMemCache(backing, MemCacheConfig{
+		MaxMemoryBytes: 1024 * 5, // Very small - 5KB
+		EvictionPolicy: EvictionLRU,
+		ShardCount:     4,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create mem cache: %v", err)
+	}
+	defer mc.Close()
+
+	fmt.Println("\n=== Cache Sizing Decision Test ===")
+
+	// Write enough to fill cache and trigger many evictions
+	fmt.Println("\nWriting 50 keys to small cache...")
+	for i := 0; i < 50; i++ {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		value := make([]byte, 200)
+		mc.Set(key, value)
+	}
+
+	stats := mc.MemStats()
+
+	fmt.Println("\n=== Cache Health Analysis ===")
+	fmt.Printf("Utilization: %.1f%%\n", stats.Utilization*100)
+	fmt.Printf("Forced Evictions: %d\n", stats.ForcedEvictions)
+	fmt.Printf("Delete Evictions: %d\n", stats.DeleteEvictions)
+	fmt.Printf("Hit Rate: %.1f%%\n", stats.HitRate*100)
+
+	// Decision criteria
+	fmt.Println("\n=== Sizing Recommendations ===")
+
+	tooSmall := false
+	reasons := []string{}
+
+	if stats.ForcedEvictions > stats.DeleteEvictions {
+		reasons = append(reasons, fmt.Sprintf(
+			"⚠️  More forced evictions (%d) than deletes (%d)",
+			stats.ForcedEvictions, stats.DeleteEvictions))
+		tooSmall = true
+	}
+
+	if stats.Utilization > 0.95 {
+		reasons = append(reasons, fmt.Sprintf(
+			"⚠️  Cache constantly full (%.1f%% utilized)",
+			stats.Utilization*100))
+		tooSmall = true
+	}
+
+	if stats.EvictionRate > 10 {
+		reasons = append(reasons, fmt.Sprintf(
+			"⚠️  High eviction rate (%.1f evictions/sec)",
+			stats.EvictionRate))
+		tooSmall = true
+	}
+
+	if tooSmall {
+		fmt.Println("❌ CACHE TOO SMALL")
+		for _, reason := range reasons {
+			fmt.Printf("   %s\n", reason)
+		}
+		suggestedSize := stats.MemoryLimit * 4
+		fmt.Printf("\n   💡 Recommendation: Increase from %d to %d bytes (4x)\n",
+			stats.MemoryLimit, suggestedSize)
+	} else {
+		fmt.Println("✅ CACHE SIZE OK")
+		fmt.Println("   Most evictions are natural (deletes)")
+		fmt.Println("   Comfortable utilization")
+	}
+
+	// We expect it to be too small given our test setup
+	if !tooSmall {
+		t.Error("Expected cache to be flagged as too small")
+	}
+
+	fmt.Println("\n✓ Sizing decision test passed")
+}
+
+// Tests moved from deadlock_regression_test.go
+
+// TestMemCache_DeadlockRegression tests the deadlock fix where:
+// - compactGlobal() holds globalMu and then locks shard.mu
+// - releaseMemory() (called from removeEntry while holding shard.mu) tries to lock globalMu
+// This was fixed by making memoryUsed atomic, eliminating the lock in releaseMemory()
+func TestMemCache_DeadlockRegression(t *testing.T) {
+	// Create a small cache to trigger eviction and compaction
+	tmpDir, err := os.MkdirTemp("", "deadlock_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cache, err := NewDiskCacheWithConfig(tmpDir, DiskCacheConfig{
+		MaxSegmentSize: 1024 * 1024, // 1MB
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Run concurrent operations that would trigger the deadlock:
+	// 1. Set operations that trigger reserveMemoryWithAllocation -> compactGlobal
+	// 2. Delete operations from compaction that call releaseMemory
+	// 3. Get operations that also call reserveMemoryWithAllocation
+
+	const (
+		numWriters = 10
+		numReaders = 10
+		numOps     = 100
+		timeout    = 10 * time.Second
+	)
+
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	// Writers - these will trigger eviction and compaction
+	for i := 0; i < numWriters; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < numOps; j++ {
+				select {
+				case <-done:
+					return
+				default:
+					key := []byte(fmt.Sprintf("writer-%d-key-%d", id, j))
+					value := make([]byte, 1024) // 1KB values
+					cache.Set(key, value)
+				}
+			}
+		}(i)
+	}
+
+	// Readers - these will also trigger memory reservation
+	for i := 0; i < numReaders; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < numOps; j++ {
+				select {
+				case <-done:
+					return
+				default:
+					key := []byte(fmt.Sprintf("writer-%d-key-%d", id%numWriters, j%numOps))
+					cache.Get(key)
+				}
+			}
+		}(i)
+	}
+
+	// Wait with timeout to detect deadlock
+	finished := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(finished)
+	}()
+
+	select {
+	case <-finished:
+		t.Log("Test completed successfully without deadlock")
+	case <-time.After(timeout):
+		close(done)
+		t.Fatal("Test timed out - likely deadlock detected")
+	}
+}
+
+// TestMemCache_ConcurrentCompactionAndEviction specifically tests the scenario where:
+// - One goroutine is in compactGlobal() holding globalMu and locking shards
+// - Another goroutine is evicting (holding shard.mu) and calling releaseMemory()
+func TestMemCache_ConcurrentCompactionAndEviction(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "compaction_eviction_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cache, err := NewDiskCacheWithConfig(tmpDir, DiskCacheConfig{
+		MaxSegmentSize: 1024 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Fill the cache to near capacity
+	for i := 0; i < 40; i++ {
+		key := []byte(fmt.Sprintf("initial-key-%d", i))
+		value := make([]byte, 1024)
+		cache.Set(key, value)
+	}
+
+	// Now hammer it with concurrent operations
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	// Goroutine that triggers compaction
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			select {
+			case <-done:
+				return
+			default:
+				_, _ = cache.Compact()
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Goroutines that trigger eviction
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				select {
+				case <-done:
+					return
+				default:
+					key := []byte(fmt.Sprintf("new-key-%d-%d", id, j))
+					value := make([]byte, 1024)
+					cache.Set(key, value)
+				}
+			}
+		}(i)
+	}
+
+	// Wait with timeout
+	finished := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(finished)
+	}()
+
+	select {
+	case <-finished:
+		t.Log("Concurrent compaction and eviction test passed")
+	case <-time.After(10 * time.Second):
+		close(done)
+		t.Fatal("Test timed out - deadlock in compaction/eviction")
 	}
 }

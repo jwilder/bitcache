@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 )
@@ -502,7 +503,7 @@ func TestDiskCache_Compaction(t *testing.T) {
 	cache.lastCompaction = time.Time{}
 
 	// Perform compaction
-	err = cache.Compact()
+	_, err = cache.Compact()
 	if err != nil {
 		t.Fatalf("Failed to compact: %v", err)
 	}
@@ -799,7 +800,7 @@ func BenchmarkDiskKV_CompactionSpeed(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cache.Compact()
+		_, _ = cache.Compact()
 	}
 }
 
@@ -1601,4 +1602,310 @@ func TestDiskCache_PartialRecordWrite(t *testing.T) {
 		t.Errorf("Expected to recover at least 3 complete records, got %d", recovered)
 	}
 	t.Logf("Recovered %d out of 5 records with partial write", recovered)
+}
+
+// Tests moved from compactn_test.go
+
+// Tests moved from scan_order_test.go
+// Tests moved from scan_order_test.go
+
+// TestDiskCache_Scan_OrderedKeys verifies that Scan returns keys in lexicographic order with btree
+func TestDiskCache_Scan_OrderedKeys(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scan-order-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir)
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Insert keys in random order to ensure they're distributed across shards
+	testKeys := []string{
+		"zebra",
+		"apple",
+		"mango",
+		"banana",
+		"orange",
+		"grape",
+		"pear",
+		"kiwi",
+		"cherry",
+		"lemon",
+		"user:alice",
+		"user:bob",
+		"user:charlie",
+		"config:db",
+		"config:app",
+		"config:api",
+	}
+
+	// Insert all keys
+	for _, key := range testKeys {
+		if err := cache.Set([]byte(key), []byte("value-"+key)); err != nil {
+			t.Fatalf("Failed to set key %s: %v", key, err)
+		}
+	}
+
+	// Scan all keys and verify they're in order
+	var scannedKeys []string
+	err = cache.Scan(nil, func(key []byte) bool {
+		scannedKeys = append(scannedKeys, string(key))
+		return false
+	})
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	// Verify the keys are sorted
+	if !sort.StringsAreSorted(scannedKeys) {
+		t.Errorf("Keys are not in sorted order. Got: %v", scannedKeys)
+	}
+
+	// Verify we got all keys
+	if len(scannedKeys) != len(testKeys) {
+		t.Errorf("Expected %d keys, got %d", len(testKeys), len(scannedKeys))
+	}
+
+	t.Logf("Scanned keys in order: %v", scannedKeys)
+}
+
+// TestDiskCache_Scan_PrefixOrderedKeys verifies that Scan with prefix returns keys in lexicographic order
+func TestDiskCache_Scan_PrefixOrderedKeys(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scan-prefix-order-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir)
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Insert keys with different prefixes
+	testKeys := []string{
+		"user:zebra",
+		"user:alice",
+		"user:mango",
+		"user:bob",
+		"config:z",
+		"config:a",
+		"config:m",
+		"data:x",
+		"data:y",
+		"data:z",
+	}
+
+	// Insert all keys
+	for _, key := range testKeys {
+		if err := cache.Set([]byte(key), []byte("value")); err != nil {
+			t.Fatalf("Failed to set key %s: %v", key, err)
+		}
+	}
+
+	// Test scanning with "user:" prefix
+	var userKeys []string
+	err = cache.Scan([]byte("user:"), func(key []byte) bool {
+		userKeys = append(userKeys, string(key))
+		return false
+	})
+	if err != nil {
+		t.Fatalf("Scan with prefix failed: %v", err)
+	}
+
+	// Verify the keys are sorted
+	if !sort.StringsAreSorted(userKeys) {
+		t.Errorf("User keys are not in sorted order. Got: %v", userKeys)
+	}
+
+	// Verify we got the right keys
+	expectedUserKeys := []string{"user:alice", "user:bob", "user:mango", "user:zebra"}
+	if len(userKeys) != len(expectedUserKeys) {
+		t.Errorf("Expected %d user keys, got %d", len(expectedUserKeys), len(userKeys))
+	}
+
+	for i, key := range userKeys {
+		if key != expectedUserKeys[i] {
+			t.Errorf("Key at position %d: expected %s, got %s", i, expectedUserKeys[i], key)
+		}
+	}
+
+	t.Logf("User keys in order: %v", userKeys)
+
+	// Test scanning with "config:" prefix
+	var configKeys []string
+	err = cache.Scan([]byte("config:"), func(key []byte) bool {
+		configKeys = append(configKeys, string(key))
+		return false
+	})
+	if err != nil {
+		t.Fatalf("Scan with config prefix failed: %v", err)
+	}
+
+	// Verify the keys are sorted
+	if !sort.StringsAreSorted(configKeys) {
+		t.Errorf("Config keys are not in sorted order. Got: %v", configKeys)
+	}
+
+	expectedConfigKeys := []string{"config:a", "config:m", "config:z"}
+	if len(configKeys) != len(expectedConfigKeys) {
+		t.Errorf("Expected %d config keys, got %d", len(expectedConfigKeys), len(configKeys))
+	}
+
+	t.Logf("Config keys in order: %v", configKeys)
+}
+
+// TestDiskCache_Scan_OrderWithDeletes verifies that deleted keys are not returned and order is maintained
+func TestDiskCache_Scan_OrderWithDeletes(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scan-delete-order-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir)
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Insert keys
+	testKeys := []string{"a", "b", "c", "d", "e", "f", "g", "h"}
+	for _, key := range testKeys {
+		if err := cache.Set([]byte(key), []byte("value")); err != nil {
+			t.Fatalf("Failed to set key %s: %v", key, err)
+		}
+	}
+
+	// Delete some keys
+	deleteKeys := []string{"b", "d", "f"}
+	for _, key := range deleteKeys {
+		if err := cache.Delete([]byte(key)); err != nil {
+			t.Fatalf("Failed to delete key %s: %v", key, err)
+		}
+	}
+
+	// Scan and verify order
+	var scannedKeys []string
+	err = cache.Scan(nil, func(key []byte) bool {
+		scannedKeys = append(scannedKeys, string(key))
+		return false
+	})
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	// Verify the keys are sorted
+	if !sort.StringsAreSorted(scannedKeys) {
+		t.Errorf("Keys are not in sorted order. Got: %v", scannedKeys)
+	}
+
+	// Verify deleted keys are not present
+	expectedKeys := []string{"a", "c", "e", "g", "h"}
+	if len(scannedKeys) != len(expectedKeys) {
+		t.Errorf("Expected %d keys, got %d: %v", len(expectedKeys), len(scannedKeys), scannedKeys)
+	}
+
+	for i, key := range scannedKeys {
+		if key != expectedKeys[i] {
+			t.Errorf("Key at position %d: expected %s, got %s", i, expectedKeys[i], key)
+		}
+	}
+
+	t.Logf("Scanned keys (with deletes) in order: %v", scannedKeys)
+}
+
+// TestDiskCache_Scan_EarlyTermination verifies that Scan stops when function returns true
+func TestDiskCache_Scan_EarlyTermination(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scan-early-term-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir)
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Insert keys
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("key-%03d", i)
+		if err := cache.Set([]byte(key), []byte("value")); err != nil {
+			t.Fatalf("Failed to set key: %v", err)
+		}
+	}
+
+	// Scan and stop after 10 keys
+	var scannedKeys []string
+	err = cache.Scan(nil, func(key []byte) bool {
+		scannedKeys = append(scannedKeys, string(key))
+		return len(scannedKeys) >= 10
+	})
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	if len(scannedKeys) != 10 {
+		t.Errorf("Expected exactly 10 keys, got %d", len(scannedKeys))
+	}
+
+	// Verify the keys are sorted
+	if !sort.StringsAreSorted(scannedKeys) {
+		t.Errorf("Keys are not in sorted order. Got: %v", scannedKeys)
+	}
+
+	t.Logf("First 10 scanned keys: %v", scannedKeys)
+}
+
+// TestDiskCache_Scan_LargeDataset tests scan performance with many keys
+func TestDiskCache_Scan_LargeDataset(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scan-large-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir)
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Insert 1000 keys
+	numKeys := 1000
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("key-%06d", i)
+		if err := cache.Set([]byte(key), []byte("value")); err != nil {
+			t.Fatalf("Failed to set key: %v", err)
+		}
+	}
+
+	// Scan all keys
+	var scannedKeys []string
+	err = cache.Scan(nil, func(key []byte) bool {
+		scannedKeys = append(scannedKeys, string(key))
+		return false
+	})
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	// Verify count
+	if len(scannedKeys) != numKeys {
+		t.Errorf("Expected %d keys, got %d", numKeys, len(scannedKeys))
+	}
+
+	// Verify sorted
+	if !sort.StringsAreSorted(scannedKeys) {
+		t.Errorf("Keys are not in sorted order")
+	}
+
+	t.Logf("Successfully scanned %d keys in sorted order", len(scannedKeys))
 }

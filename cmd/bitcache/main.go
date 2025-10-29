@@ -141,8 +141,14 @@ var delCmd = &cobra.Command{
 var compactCmd = &cobra.Command{
 	Use:   "compact",
 	Short: "Compact the database",
-	Long:  `Compact the database by removing obsolete entries and reclaiming disk space. By default, all segments are compacted. Use --count to compact only the oldest N segments.`,
-	Args:  cobra.NoArgs,
+	Long: `Compact the database by removing obsolete entries and reclaiming disk space.
+
+Modes:
+  Default: Automatic compaction (LSM or GC as needed)
+  --list: List segments by level
+  --gc: Perform garbage collection to reclaim dead data
+  --auto: Automatic compaction (same as default)`,
+	Args: cobra.NoArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		// Initialize database with custom segment size if specified
 		var err error
@@ -169,19 +175,238 @@ var compactCmd = &cobra.Command{
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if compactCount > 0 {
-			fmt.Printf("Starting compaction of %d oldest segments...\n", compactCount)
-		} else {
-			fmt.Println("Starting compaction of all segments...")
+		// List mode
+		if compactList {
+			return listSegments()
 		}
 
-		if err := db.CompactN(compactCount); err != nil {
+		// Auto compaction mode
+		if compactAuto {
+			return performAutoCompaction()
+		}
+
+		// Garbage collection mode
+		if compactGC {
+			return performGarbageCollection()
+		}
+
+		// Default: Auto-compact mode (LSM or GC as needed)
+		fmt.Println("Starting automatic compaction...")
+
+		result, err := db.Compact()
+		if err != nil {
 			return fmt.Errorf("compaction failed: %w", err)
 		}
 
-		fmt.Println("Compaction completed successfully")
+		// Log compaction details
+		if result != nil && result.Type != "none" {
+			fmt.Println("\n=== Compaction Details ===")
+			fmt.Printf("Type: %s\n", result.Type)
+			if result.Level >= 0 {
+				fmt.Printf("Level: %d\n", result.Level)
+			}
+			if len(result.InputSegments) > 0 {
+				fmt.Printf("Input segments: %d\n", len(result.InputSegments))
+			}
+			if result.OutputSegment != "" {
+				fmt.Printf("Output segment: %s\n", result.OutputSegment)
+			}
+			if result.LiveEntries > 0 {
+				fmt.Printf("Live entries: %d\n", result.LiveEntries)
+			}
+			if result.BytesWritten > 0 {
+				fmt.Printf("Bytes written: %d\n", result.BytesWritten)
+			}
+			if len(result.DeletedSegments) > 0 {
+				fmt.Printf("Deleted segments: %d\n", len(result.DeletedSegments))
+			}
+		} else {
+			fmt.Println("No compaction needed")
+		}
+
+		fmt.Println("\nCompaction completed successfully")
 		return nil
 	},
+}
+
+func listSegments() error {
+	byLevel, err := db.GetSegmentsByLevel()
+	if err != nil {
+		return fmt.Errorf("failed to get segments: %w", err)
+	}
+
+	fmt.Println("\nSegments by level:")
+	for level := uint8(0); level <= 4; level++ {
+		segments := byLevel[level]
+		if len(segments) == 0 {
+			continue
+		}
+
+		fmt.Printf("\nLevel %d (%d segments):\n", level, len(segments))
+		for _, seg := range segments {
+			fmt.Printf("  %s (%d bytes)\n", seg.ID.String(), seg.TotalBytes)
+		}
+	}
+	return nil
+}
+
+func performGarbageCollection() error {
+	fmt.Println("\n=== Garbage Collection ===")
+	fmt.Println("Scanning segments for dead data...")
+
+	// Get GC stats (which internally scans all segments)
+	gcStats := db.GetGCStats()
+	segmentStats := gcStats.SegmentStats
+
+	if len(segmentStats) == 0 {
+		fmt.Println("No segments to scan")
+		return nil
+	}
+
+	fmt.Printf("\nFound %d segments:\n\n", len(segmentStats))
+
+	// Display statistics for each segment
+	var totalBytes, totalLive, totalDead int64
+	var segmentsNeedingGC int
+
+	for _, seg := range segmentStats {
+		deadPct := seg.DeadRatio * 100
+		fmt.Printf("Segment %d:\n", seg.FileID)
+		fmt.Printf("  Total: %d bytes, Live: %d bytes, Dead: %d bytes\n",
+			seg.TotalBytes, seg.LiveBytes, seg.DeadBytes)
+		fmt.Printf("  Dead: %.1f%%", deadPct)
+
+		if seg.DeadRatio >= 0.4 {
+			fmt.Printf(" ⚠️  (needs GC)")
+			segmentsNeedingGC++
+		}
+		fmt.Println()
+
+		totalBytes += seg.TotalBytes
+		totalLive += seg.LiveBytes
+		totalDead += seg.DeadBytes
+	}
+
+	// Show summary
+	fmt.Println("\nSummary:")
+	fmt.Printf("  Total data: %d bytes\n", totalBytes)
+	fmt.Printf("  Live data: %d bytes\n", totalLive)
+	fmt.Printf("  Dead data: %d bytes", totalDead)
+	if totalBytes > 0 {
+		overallDeadPct := float64(totalDead) / float64(totalBytes) * 100
+		fmt.Printf(" (%.1f%%)\n", overallDeadPct)
+	} else {
+		fmt.Println()
+	}
+	fmt.Printf("  Segments needing GC: %d\n", segmentsNeedingGC)
+
+	if compactDryRun {
+		fmt.Println("\n[DRY RUN] Would perform garbage collection")
+		fmt.Println("Use without --dry-run to actually perform GC")
+		return nil
+	}
+
+	if segmentsNeedingGC == 0 {
+		fmt.Println("\n✓ No segments need GC at this time")
+		return nil
+	}
+
+	// Perform integrated compaction (includes GC)
+	beforeStats := db.Stats()
+	fmt.Println("\nRunning compaction (includes GC)...")
+	result, err := db.Compact()
+	if err != nil {
+		return fmt.Errorf("compaction failed: %w", err)
+	}
+
+	// Show results
+	afterStats := db.Stats()
+	fmt.Printf("\n✓ Compaction completed\n\n")
+
+	if result != nil && result.Type != "none" {
+		fmt.Printf("Compaction type: %s\n", result.Type)
+		if len(result.InputSegments) > 0 {
+			fmt.Printf("Processed segments: %d\n", len(result.InputSegments))
+		}
+	}
+
+	fmt.Printf("\nResults:\n")
+	fmt.Printf("  Keys: %d\n", afterStats.Keys)
+	fmt.Printf("  Data size: %d bytes", afterStats.DataSize)
+
+	if beforeStats.DataSize > afterStats.DataSize {
+		saved := beforeStats.DataSize - afterStats.DataSize
+		pct := float64(saved) / float64(beforeStats.DataSize) * 100
+		fmt.Printf(" (saved %d bytes, %.1f%%)\n", saved, pct)
+	} else {
+		fmt.Println()
+	}
+
+	// Show final segment layout
+	return listSegments()
+}
+
+func performAutoCompaction() error {
+	fmt.Println("\n=== Automatic Compaction ===")
+	fmt.Println("Determining optimal compaction strategy...")
+
+	// Show before state
+	byLevel, err := db.GetSegmentsByLevel()
+	if err != nil {
+		return fmt.Errorf("failed to get segments: %w", err)
+	}
+
+	fmt.Println("\nBefore compaction:")
+	for level := uint8(0); level <= 4; level++ {
+		if len(byLevel[level]) > 0 {
+			fmt.Printf("  L%d: %d segments\n", level, len(byLevel[level]))
+		}
+	}
+
+	// Perform automatic compaction
+	fmt.Println("\nRunning Compact()...")
+	beforeStats := db.Stats()
+
+	result, err := db.Compact()
+	if err != nil {
+		return fmt.Errorf("compaction failed: %w", err)
+	}
+
+	// Show after state
+	byLevel, _ = db.GetSegmentsByLevel()
+	afterStats := db.Stats()
+
+	fmt.Println("\n✓ Compaction completed")
+
+	if result != nil && result.Type != "none" {
+		fmt.Printf("\nCompaction performed: %s at level %d\n", result.Type, result.Level)
+		if len(result.InputSegments) > 0 {
+			fmt.Printf("Processed %d segments\n", len(result.InputSegments))
+		}
+	} else {
+		fmt.Println("\nNo compaction was needed")
+	}
+
+	fmt.Println("\nAfter compaction:")
+	for level := uint8(0); level <= 4; level++ {
+		if len(byLevel[level]) > 0 {
+			fmt.Printf("  L%d: %d segments\n", level, len(byLevel[level]))
+		}
+	}
+
+	// Show data size change
+	if beforeStats.DataSize != afterStats.DataSize {
+		if beforeStats.DataSize > afterStats.DataSize {
+			saved := beforeStats.DataSize - afterStats.DataSize
+			pct := float64(saved) / float64(beforeStats.DataSize) * 100
+			fmt.Printf("\nSpace reclaimed: %d bytes (%.1f%%)\n", saved, pct)
+		}
+	} else {
+		fmt.Println("\nNo compaction was needed")
+	}
+
+	// Show detailed segment info
+	return listSegments()
 }
 
 var statsCmd = &cobra.Command{
@@ -217,8 +442,11 @@ var statsCmd = &cobra.Command{
 }
 
 var (
-	scanPrefix   string
-	compactCount int
+	scanPrefix    string
+	compactList   bool
+	compactDryRun bool
+	compactGC     bool
+	compactAuto   bool
 )
 
 var scanCmd = &cobra.Command{
@@ -826,7 +1054,10 @@ func init() {
 	scanCmd.Flags().StringVarP(&scanPrefix, "prefix", "p", "", "Filter keys by prefix")
 
 	// Add compact command flags
-	compactCmd.Flags().IntVarP(&compactCount, "count", "c", 0, "Number of oldest segments to compact (0 = all)")
+	compactCmd.Flags().BoolVar(&compactList, "list", false, "List segments by level")
+	compactCmd.Flags().BoolVar(&compactDryRun, "dry-run", false, "Show what would be compacted without doing it")
+	compactCmd.Flags().BoolVar(&compactGC, "gc", false, "Perform garbage collection to reclaim dead data")
+	compactCmd.Flags().BoolVar(&compactAuto, "auto", false, "Automatic compaction (LSM or GC as needed)")
 	compactCmd.Flags().Int64Var(&segmentSize, "segment-size", 0, "Maximum segment size in bytes (0 = default 16MB)")
 
 	// Add set command flags

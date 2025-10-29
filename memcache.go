@@ -2,6 +2,7 @@ package bitcache
 
 import (
 	"errors"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -156,8 +157,20 @@ type MemCache struct {
 	// Global memory tracking
 	globalMu    sync.RWMutex
 	arena       *memoryArena
-	memoryUsed  int64
+	memoryUsed  atomic.Int64
 	memoryLimit int64
+
+	// Rate limiting
+	lastCompaction atomic.Int64 // Unix timestamp in milliseconds
+	lastEviction   atomic.Int64 // Unix timestamp in milliseconds
+	memoryPressure atomic.Int32 // 0-100, percentage of memory used
+
+	// Cache performance stats
+	hits            atomic.Int64 // Cache hits
+	misses          atomic.Int64 // Cache misses
+	forcedEvictions atomic.Int64 // Evictions due to memory pressure
+	deleteEvictions atomic.Int64 // Explicit Delete() calls
+	statsStartTime  time.Time    // When stats were last reset
 }
 
 // cacheShard represents a single shard of the cache
@@ -171,6 +184,10 @@ type cacheShard struct {
 	accessCounter uint64
 	entryPool     *sync.Pool
 	memCache      *MemCache // reference to parent for global memory tracking
+
+	// Backoff tracking
+	consecutiveFailures atomic.Int32
+	backoffUntil        atomic.Int64 // Unix timestamp in milliseconds
 }
 
 // cacheEntry represents a cached key-value pair
@@ -241,6 +258,7 @@ func NewMemCache(backing Cache, config MemCacheConfig) (*MemCache, error) {
 		shards:         make([]*cacheShard, config.ShardCount),
 		compactionDone: make(chan struct{}),
 		memoryLimit:    config.MaxMemoryBytes,
+		statsStartTime: time.Now(),
 	}
 
 	// Initialize arena after mc is created so it can reference mc
@@ -304,6 +322,22 @@ func (s *cacheShard) get(keyHash uint64) ([]byte, bool) {
 
 // tryCache attempts to cache a key-value pair in the shard
 func (s *cacheShard) tryCache(keyHash uint64, key []byte, value []byte) {
+	// Check if we're in backoff period
+	if backoffTime := s.backoffUntil.Load(); backoffTime > 0 {
+		nowMs := time.Now().UnixMilli()
+		if nowMs < backoffTime {
+			return
+		}
+		// Backoff expired, reset
+		s.backoffUntil.Store(0)
+		s.consecutiveFailures.Store(0)
+	}
+
+	// Check memory pressure - skip caching when critically high (> 95%)
+	if s.memCache.memoryPressure.Load() > 95 {
+		return
+	}
+
 	// Check if value exceeds maximum size limit
 	if s.maxValueSize > 0 && int64(len(value)) > s.maxValueSize {
 		return
@@ -316,11 +350,28 @@ func (s *cacheShard) tryCache(keyHash uint64, key []byte, value []byte) {
 
 	entrySize := int64(len(key) + len(value) + minEntrySize)
 
+	// Early rejection - don't try to cache entries that are too large
+	// relative to the total cache size (> 10% of total memory)
+	if entrySize > s.memCache.memoryLimit/10 {
+		return
+	}
+
 	// Try to reserve global memory - evict entries if necessary
 	// Do this BEFORE locking the shard to avoid deadlock
-	if !s.memCache.reserveMemory(entrySize, s) {
+	if !s.memCache.reserveMemoryWithAllocation(entrySize, len(key), len(value), s) {
+		// Track failures and implement exponential backoff
+		failures := s.consecutiveFailures.Add(1)
+		if failures >= 3 {
+			// After 3 consecutive failures, enter backoff period
+			// Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 32s
+			backoffSeconds := int64(1 << min(int(failures-3), 5))
+			s.backoffUntil.Store(time.Now().UnixMilli() + (backoffSeconds * 1000))
+		}
 		return // Cannot fit even after eviction
 	}
+
+	// Reset failure counter on success
+	s.consecutiveFailures.Store(0)
 
 	// Allocate memory for key and value in global arena
 	s.memCache.globalMu.Lock()
@@ -329,6 +380,8 @@ func (s *cacheShard) tryCache(keyHash uint64, key []byte, value []byte) {
 	s.memCache.globalMu.Unlock()
 
 	if keyCopy == nil || valueCopy == nil {
+		// This should not happen since we checked in reserveMemoryWithAllocation
+		// But if it does, release the reserved memory
 		s.memCache.releaseMemory(entrySize)
 		return
 	}
@@ -370,6 +423,8 @@ func (s *cacheShard) delete(keyHash uint64) {
 
 	if entry, found := s.entries[keyHash]; found {
 		s.removeEntry(entry)
+		// Track explicit delete eviction
+		s.memCache.deleteEvictions.Add(1)
 	}
 }
 
@@ -433,6 +488,8 @@ func (s *cacheShard) evictLRU() {
 
 	entry := node.entry
 	s.removeEntry(entry)
+	// Track forced eviction due to memory pressure
+	s.memCache.forcedEvictions.Add(1)
 }
 
 // evictLFU removes the least frequently used entry
@@ -450,6 +507,8 @@ func (s *cacheShard) evictLFU() {
 
 	if leastFrequent != nil {
 		s.removeEntry(leastFrequent)
+		// Track forced eviction due to memory pressure
+		s.memCache.forcedEvictions.Add(1)
 	}
 }
 
@@ -598,10 +657,12 @@ func (mc *MemCache) Get(key []byte) ([]byte, error) {
 
 	// Try memory cache first - all locking handled inside shard
 	if value, found := shard.get(keyHash); found {
+		mc.hits.Add(1)
 		return value, nil
 	}
 
 	// Cache miss - read from backing store
+	mc.misses.Add(1)
 	value, err := mc.backing.Get(key)
 	if err != nil {
 		return nil, err
@@ -679,9 +740,7 @@ func (mc *MemCache) Stats() Stats {
 		memKeys += int64(entries)
 	}
 
-	mc.globalMu.RLock()
-	memSize := mc.memoryUsed
-	mc.globalMu.RUnlock()
+	memSize := mc.memoryUsed.Load()
 
 	// Keep the backing cache's key count (authoritative source)
 	// memKeys represents only what's cached in memory, not total keys
@@ -707,7 +766,7 @@ func (mc *MemCache) MemStats() MemStats {
 	}
 
 	mc.globalMu.RLock()
-	stats.MemoryUsed = mc.memoryUsed
+	stats.MemoryUsed = mc.memoryUsed.Load()
 	stats.MemoryAllocated = mc.arena.allocated
 
 	// Collect slab breakdown
@@ -726,7 +785,45 @@ func (mc *MemCache) MemStats() MemStats {
 
 	stats.MemoryLimit = mc.config.MaxMemoryBytes
 	stats.Shards = int64(len(mc.shards))
+
+	// Add performance metrics
+	stats.Hits = mc.hits.Load()
+	stats.Misses = mc.misses.Load()
+	stats.ForcedEvictions = mc.forcedEvictions.Load()
+	stats.DeleteEvictions = mc.deleteEvictions.Load()
+
+	// Calculate hit rate
+	totalRequests := stats.Hits + stats.Misses
+	if totalRequests > 0 {
+		stats.HitRate = float64(stats.Hits) / float64(totalRequests)
+	}
+
+	// Calculate utilization
+	if stats.MemoryLimit > 0 {
+		stats.Utilization = float64(stats.MemoryUsed) / float64(stats.MemoryLimit)
+	}
+
+	// Calculate eviction rate (evictions per second)
+	elapsed := time.Since(mc.statsStartTime).Seconds()
+	if elapsed > 0 {
+		stats.EvictionRate = float64(stats.ForcedEvictions) / elapsed
+	}
+
+	// Calculate average item size
+	if stats.Entries > 0 {
+		stats.AvgItemSize = stats.MemoryUsed / stats.Entries
+	}
+
 	return stats
+}
+
+// ResetStats resets the performance counters for a new monitoring window
+func (mc *MemCache) ResetStats() {
+	mc.hits.Store(0)
+	mc.misses.Store(0)
+	mc.forcedEvictions.Store(0)
+	mc.deleteEvictions.Store(0)
+	mc.statsStartTime = time.Now()
 }
 
 // MemStats provides memory cache statistics
@@ -738,6 +835,16 @@ type MemStats struct {
 	Shards          int64
 	Fragmentation   float64       // Ratio of wasted space (0.0-1.0)
 	SlabBreakdown   map[int64]int // Map of slab size -> count
+
+	// Cache performance metrics
+	Hits            int64   // Cache hits
+	Misses          int64   // Cache misses
+	ForcedEvictions int64   // Evictions due to memory pressure
+	DeleteEvictions int64   // Explicit Delete() calls
+	HitRate         float64 // Hits / (Hits + Misses), 0.0-1.0
+	Utilization     float64 // MemoryUsed / MemoryLimit, 0.0-1.0
+	EvictionRate    float64 // Forced evictions per second
+	AvgItemSize     int64   // Average item size in bytes
 }
 
 // reserveMemory attempts to reserve memory for a new entry
@@ -747,10 +854,10 @@ func (mc *MemCache) reserveMemory(size int64, requestingShard *cacheShard) bool 
 	// Try to make room by evicting from any shard
 	for {
 		mc.globalMu.Lock()
-		needToEvict := mc.memoryUsed+size > mc.memoryLimit
+		needToEvict := mc.memoryUsed.Load()+size > mc.memoryLimit
 		if !needToEvict {
 			// We have enough space, reserve it
-			mc.memoryUsed += size
+			mc.memoryUsed.Add(size)
 			mc.globalMu.Unlock()
 			return true
 		}
@@ -793,11 +900,298 @@ func (mc *MemCache) reserveMemory(size int64, requestingShard *cacheShard) bool 
 	}
 }
 
+// reserveMemoryWithAllocation attempts to reserve memory for a new entry,
+// taking into account both logical memory usage and physical arena allocation.
+// It ensures that the arena will be able to allocate the required slabs.
+// Returns true if memory was successfully reserved.
+func (mc *MemCache) reserveMemoryWithAllocation(size int64, keySize int, valueSize int, requestingShard *cacheShard) bool {
+	const (
+		maxEvictionAttempts   = 10   // Reduced from 100 to limit churn
+		minEvictionInterval   = 100  // milliseconds between evictions
+		minCompactionInterval = 1000 // milliseconds between compactions (1 second)
+	)
+
+	compactionAttempted := false
+	evictionAttempts := 0
+	nowMs := time.Now().UnixMilli()
+
+	// Try to make room by evicting from any shard
+	for evictionAttempts < maxEvictionAttempts {
+		mc.globalMu.Lock()
+
+		// Calculate the worst-case slab overhead
+		worstCaseOverhead := estimateSlabOverhead(keySize, valueSize, mc.arena)
+
+		// Check if we have enough memory budget for both logical usage and arena allocation
+		// We need to ensure: memoryUsed + size <= memoryLimit
+		// AND: arena.allocated + worstCaseOverhead <= memoryLimit
+		needToEvictLogical := mc.memoryUsed.Load()+size > mc.memoryLimit
+		needToEvictArena := mc.arena.allocated+worstCaseOverhead > mc.memoryLimit
+
+		if !needToEvictLogical && !needToEvictArena {
+			// We have enough space, reserve it
+			mc.memoryUsed.Add(size)
+			mc.globalMu.Unlock()
+			mc.updateMemoryPressure()
+			return true
+		}
+
+		// Check if we recently evicted - if so, give up instead of churning
+		lastEvict := mc.lastEviction.Load()
+		if nowMs-lastEvict < minEvictionInterval {
+			mc.globalMu.Unlock()
+			return false
+		}
+
+		// If arena is the problem and we haven't tried compaction yet, try it
+		// This handles the case where we have logical memory available but arena is fragmented
+		if needToEvictArena && !compactionAttempted {
+			lastCompact := mc.lastCompaction.Load()
+			if nowMs-lastCompact > minCompactionInterval {
+				mc.globalMu.Unlock()
+				mc.lastCompaction.Store(nowMs)
+				mc.compactGlobal()
+				compactionAttempted = true
+				continue
+			}
+		}
+
+		mc.globalMu.Unlock()
+		evictionAttempts++
+
+		// Need to evict - do this without holding global lock to avoid deadlock
+		evicted := false
+
+		// First try to evict from the requesting shard
+		if requestingShard != nil {
+			requestingShard.mu.Lock()
+			if len(requestingShard.entries) > 0 {
+				requestingShard.evict()
+				evicted = true
+			}
+			requestingShard.mu.Unlock()
+		}
+
+		// If that didn't work, try other shards
+		if !evicted {
+			for _, shard := range mc.shards {
+				if shard == requestingShard {
+					continue
+				}
+				shard.mu.Lock()
+				if len(shard.entries) > 0 {
+					shard.evict()
+					evicted = true
+					shard.mu.Unlock()
+					break
+				}
+				shard.mu.Unlock()
+			}
+		}
+
+		// If we couldn't evict anything, we can't make room
+		if !evicted {
+			return false
+		}
+
+		// Update last eviction time
+		mc.lastEviction.Store(time.Now().UnixMilli())
+
+		// After evicting, if the problem was arena space (not logical memory),
+		// we need to compact to actually reclaim the arena space
+		if needToEvictArena && !compactionAttempted {
+			lastCompact := mc.lastCompaction.Load()
+			nowMs = time.Now().UnixMilli()
+			if nowMs-lastCompact > minCompactionInterval {
+				mc.lastCompaction.Store(nowMs)
+				mc.compactGlobal()
+				compactionAttempted = true
+			}
+		}
+	}
+
+	return false
+}
+
+// estimateSlabOverhead estimates the worst-case slab allocation overhead
+// for allocating a key and value of the given sizes
+func estimateSlabOverhead(keySize int, valueSize int, arena *memoryArena) int64 {
+	// Check if key fits in existing slabs
+	keyFits := false
+	valueFits := false
+	bothFitInSameSlab := false
+
+	for _, s := range arena.slabs {
+		availableSpace := int64(len(s.data)) - s.offset
+		if availableSpace >= int64(keySize) {
+			keyFits = true
+		}
+		if availableSpace >= int64(valueSize) {
+			valueFits = true
+		}
+		// Check if both can fit in the same slab
+		if availableSpace >= int64(keySize)+int64(valueSize) {
+			bothFitInSameSlab = true
+		}
+	}
+
+	// If both fit in the same existing slab, no overhead
+	if bothFitInSameSlab {
+		return 0
+	}
+
+	// If both fit in existing slabs (but not the same one), no overhead
+	if keyFits && valueFits {
+		return 0
+	}
+
+	// Calculate slab size needed if we need a new slab
+	totalSize := int64(keySize + valueSize)
+
+	// If key doesn't fit but value does, we only need a slab for the key
+	if !keyFits && valueFits {
+		keySlabSize := arena.slabSize
+		if int64(keySize) > keySlabSize {
+			found := false
+			for i := arena.tierIndex + 1; i < len(slabSizeTiers); i++ {
+				if int64(keySize) <= slabSizeTiers[i] {
+					keySlabSize = slabSizeTiers[i]
+					found = true
+					break
+				}
+			}
+			if !found {
+				keySlabSize = nextPowerOfTwo(int64(keySize))
+			}
+		}
+		// Cap at remaining memory capacity
+		if arena.memCache != nil {
+			remainingCapacity := arena.memCache.memoryLimit - arena.allocated
+			if keySlabSize > remainingCapacity {
+				if int64(keySize) > remainingCapacity {
+					return keySlabSize // Return full size, caller will handle eviction
+				}
+				keySlabSize = remainingCapacity
+			}
+		}
+		return keySlabSize
+	}
+
+	// If value doesn't fit but key does, we only need a slab for the value
+	if keyFits && !valueFits {
+		valueSlabSize := arena.slabSize
+		if int64(valueSize) > valueSlabSize {
+			found := false
+			for i := arena.tierIndex + 1; i < len(slabSizeTiers); i++ {
+				if int64(valueSize) <= slabSizeTiers[i] {
+					valueSlabSize = slabSizeTiers[i]
+					found = true
+					break
+				}
+			}
+			if !found {
+				valueSlabSize = nextPowerOfTwo(int64(valueSize))
+			}
+		}
+		// Cap at remaining memory capacity
+		if arena.memCache != nil {
+			remainingCapacity := arena.memCache.memoryLimit - arena.allocated
+			if valueSlabSize > remainingCapacity {
+				if int64(valueSize) > remainingCapacity {
+					return valueSlabSize // Return full size, caller will handle eviction
+				}
+				valueSlabSize = remainingCapacity
+			}
+		}
+		return valueSlabSize
+	}
+
+	// Neither fits - check if both can fit in a single new slab
+	slabSize := arena.slabSize
+	if totalSize > slabSize {
+		// Need a larger slab
+		found := false
+		for i := arena.tierIndex + 1; i < len(slabSizeTiers); i++ {
+			if totalSize <= slabSizeTiers[i] {
+				slabSize = slabSizeTiers[i]
+				found = true
+				break
+			}
+		}
+		if !found {
+			slabSize = nextPowerOfTwo(totalSize)
+		}
+	}
+
+	// Cap slab size at available memory capacity
+	if arena.memCache != nil {
+		remainingCapacity := arena.memCache.memoryLimit - arena.allocated
+		if slabSize > remainingCapacity {
+			// If we can't even fit the data in remaining space, return the full slab size
+			// (caller will handle eviction)
+			if totalSize > remainingCapacity {
+				return slabSize
+			}
+			// Otherwise cap at remaining capacity
+			slabSize = remainingCapacity
+		}
+	}
+
+	// If both fit in one slab, return that slab size
+	if totalSize <= slabSize {
+		return slabSize
+	}
+
+	// Otherwise, we need separate slabs
+	keySlabSize := arena.slabSize
+	if int64(keySize) > keySlabSize {
+		found := false
+		for i := arena.tierIndex + 1; i < len(slabSizeTiers); i++ {
+			if int64(keySize) <= slabSizeTiers[i] {
+				keySlabSize = slabSizeTiers[i]
+				found = true
+				break
+			}
+		}
+		if !found {
+			keySlabSize = nextPowerOfTwo(int64(keySize))
+		}
+	}
+
+	valueSlabSize := arena.slabSize
+	if int64(valueSize) > valueSlabSize {
+		found := false
+		for i := arena.tierIndex + 1; i < len(slabSizeTiers); i++ {
+			if int64(valueSize) <= slabSizeTiers[i] {
+				valueSlabSize = slabSizeTiers[i]
+				found = true
+				break
+			}
+		}
+		if !found {
+			valueSlabSize = nextPowerOfTwo(int64(valueSize))
+		}
+	}
+
+	return keySlabSize + valueSlabSize
+}
+
 // releaseMemory releases memory when an entry is removed
 func (mc *MemCache) releaseMemory(size int64) {
-	mc.globalMu.Lock()
-	mc.memoryUsed -= size
-	mc.globalMu.Unlock()
+	mc.memoryUsed.Add(-size)
+	mc.updateMemoryPressure()
+}
+
+// updateMemoryPressure updates the memory pressure metric (0-100)
+func (mc *MemCache) updateMemoryPressure() {
+	pressure := int32(0)
+	if mc.memoryLimit > 0 {
+		pressure = int32((mc.memoryUsed.Load() * 100) / mc.memoryLimit)
+		if pressure > 100 {
+			pressure = 100
+		}
+	}
+	mc.memoryPressure.Store(pressure)
 }
 
 // getShard returns the shard for a given key hash
@@ -917,12 +1311,26 @@ func (mc *MemCache) checkAndCompact() {
 	}
 
 	// Calculate global fragmentation
-	wasted := mc.arena.allocated - mc.memoryUsed
+	wasted := mc.arena.allocated - mc.memoryUsed.Load()
 	fragmentation := float64(wasted) / float64(mc.arena.allocated)
+
+	// Calculate memory pressure
+	pressure := float64(mc.memoryUsed.Load()) / float64(mc.memoryLimit)
 	mc.globalMu.RUnlock()
 
+	// Adaptive threshold based on memory pressure
+	// When memory is tight (>90% used), only compact if fragmentation is severe (>60%)
+	// to avoid unnecessary work. When memory is comfortable (<70% used), compact at
+	// normal threshold to keep things clean.
+	threshold := mc.config.CompactionThreshold
+	if pressure > 0.9 {
+		threshold = 0.6 // Only compact if fragmentation is severe
+	} else if pressure > 0.8 {
+		threshold = 0.5 // Moderately higher threshold
+	}
+
 	// If fragmentation exceeds threshold, perform global compaction
-	if fragmentation >= mc.config.CompactionThreshold {
+	if fragmentation >= threshold {
 		mc.compactGlobal()
 	}
 }
@@ -936,13 +1344,14 @@ func (mc *MemCache) compactGlobal() {
 	mc.globalMu.Lock()
 	defer mc.globalMu.Unlock()
 
-	if mc.memoryUsed == 0 {
+	memUsed := mc.memoryUsed.Load()
+	if memUsed == 0 {
 		return
 	}
 
 	// Create a new arena with appropriately sized slab
 	// Add 20% buffer to reduce the chance of needing multiple slabs
-	totalNeeded := mc.memoryUsed + (mc.memoryUsed / 5)
+	totalNeeded := memUsed + (memUsed / 5)
 	newArena := newMemoryArenaWithSize(totalNeeded, mc)
 
 	// Re-allocate all entries across all shards in the new arena
@@ -981,4 +1390,91 @@ func (mc *MemCache) Compact() {
 	}
 
 	mc.checkAndCompact()
+}
+
+// CompactN compacts up to N shards that exceed the fragmentation threshold.
+// If count is 0 or negative, all eligible shards are compacted.
+// Shards are prioritized by fragmentation ratio (highest first).
+func (mc *MemCache) CompactN(count int) error {
+	if mc.closed.Load() {
+		return ErrCacheClosed
+	}
+
+	// If count is 0 or negative, compact all eligible shards
+	if count <= 0 {
+		mc.checkAndCompact()
+		return nil
+	}
+
+	// Calculate fragmentation for each shard
+	type shardFragmentation struct {
+		index         int
+		fragmentation float64
+		allocated     int64
+		used          int64
+	}
+
+	shardFrags := make([]shardFragmentation, 0, len(mc.shards))
+	threshold := mc.config.CompactionThreshold
+
+	for i, shard := range mc.shards {
+		shard.mu.RLock()
+		var used int64
+		for _, entry := range shard.entries {
+			used += entry.size
+		}
+		shard.mu.RUnlock()
+
+		// Get allocated memory for this shard (estimated)
+		mc.globalMu.RLock()
+		totalAllocated := mc.arena.allocated
+		totalUsed := mc.memoryUsed.Load()
+		mc.globalMu.RUnlock()
+
+		// Estimate shard's portion of allocated memory
+		var allocated int64
+		if totalUsed > 0 {
+			allocated = (used * totalAllocated) / totalUsed
+		} else {
+			allocated = 0
+		}
+
+		// Calculate fragmentation for this shard
+		var fragmentation float64
+		if allocated > 0 {
+			wasted := allocated - used
+			fragmentation = float64(wasted) / float64(allocated)
+		}
+
+		// Only consider shards that exceed threshold
+		if fragmentation >= threshold {
+			shardFrags = append(shardFrags, shardFragmentation{
+				index:         i,
+				fragmentation: fragmentation,
+				allocated:     allocated,
+				used:          used,
+			})
+		}
+	}
+
+	// If no shards need compaction, return early
+	if len(shardFrags) == 0 {
+		return nil
+	}
+
+	// Sort by fragmentation (highest first)
+	sort.Slice(shardFrags, func(i, j int) bool {
+		return shardFrags[i].fragmentation > shardFrags[j].fragmentation
+	})
+
+	// Limit to N shards
+	if count < len(shardFrags) {
+		shardFrags = shardFrags[:count]
+	}
+
+	// Perform global compaction if we have eligible shards
+	// Since MemCache uses a global arena, we compact globally
+	mc.compactGlobal()
+
+	return nil
 }
