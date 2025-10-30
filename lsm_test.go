@@ -18,7 +18,7 @@ func TestIntelligentCompaction(t *testing.T) {
 
 	cache, err := NewDiskCacheWithConfig(tmpDir, DiskCacheConfig{
 		MaxSegmentSize: 1024 * 30, // Smaller segments to create more L0 segments (30KB)
-	})
+	}, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestIntelligentCompactionL4(t *testing.T) {
 
 	cache, err := NewDiskCacheWithConfig(tmpDir, DiskCacheConfig{
 		MaxSegmentSize: 1024 * 30, // Very small segments
-	})
+	}, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestLSMCompaction(t *testing.T) {
 
 	cache, err := NewDiskCacheWithConfig(tmpDir, DiskCacheConfig{
 		MaxSegmentSize: 1024 * 50, // Small segments to trigger rotation (50KB)
-	})
+	}, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -306,7 +306,7 @@ func TestLSMCompaction(t *testing.T) {
 
 	// Close and reopen cache to reload file references
 	cache.Close()
-	cache, err = NewDiskCache(tmpDir)
+	cache, err = NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to reopen cache: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestLSMMultiLevelCompaction(t *testing.T) {
 
 	cache, err := NewDiskCacheWithConfig(tmpDir, DiskCacheConfig{
 		MaxSegmentSize: 1024 * 50, // Very small segments
-	})
+	}, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}

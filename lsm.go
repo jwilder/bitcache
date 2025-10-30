@@ -107,7 +107,7 @@ func DefaultLSMCompactionConfig() LSMCompactionConfig {
 }
 
 // getSegmentsByLevel returns segments grouped by level, sorted by generation within each level
-func (c *DiskCache) getSegmentsByLevel() (map[uint8][]*segmentInfo, error) {
+func (c *DiskCache[V]) getSegmentsByLevel() (map[uint8][]*segmentInfo, error) {
 	files, err := filepath.Glob(filepath.Join(c.dir, "*.log"))
 	if err != nil {
 		return nil, err
@@ -156,7 +156,7 @@ func (c *DiskCache) getSegmentsByLevel() (map[uint8][]*segmentInfo, error) {
 }
 
 // shouldCompactLSM determines if LSM-style compaction is needed
-func (c *DiskCache) shouldCompactLSM(config LSMCompactionConfig) (level uint8, reason string, ok bool) {
+func (c *DiskCache[V]) shouldCompactLSM(config LSMCompactionConfig) (level uint8, reason string, ok bool) {
 	byLevel, err := c.getSegmentsByLevel()
 	if err != nil || len(byLevel) == 0 {
 		return 0, "", false
@@ -201,7 +201,7 @@ type compactEntry struct {
 
 // compactSegmentsToLevel compacts multiple segments into a single output segment
 // Returns the number of live entries and bytes written
-func (c *DiskCache) compactSegmentsToLevel(segments []*segmentInfo, outputID segmentID) (int, int64, error) {
+func (c *DiskCache[V]) compactSegmentsToLevel(segments []*segmentInfo, outputID segmentID) (int, int64, error) {
 	outputPath := filepath.Join(c.dir, outputID.String())
 
 	// Open output file
@@ -245,7 +245,7 @@ func (c *DiskCache) compactSegmentsToLevel(segments []*segmentInfo, outputID seg
 }
 
 // readSegmentEntries reads all live entries from a segment
-func (c *DiskCache) readSegmentEntries(file *os.File, segID segmentID, entries map[string]*compactEntry) error {
+func (c *DiskCache[V]) readSegmentEntries(file *os.File, segID segmentID, entries map[string]*compactEntry) error {
 	// Read file header
 	header, err := c.readFileHeader(file)
 	if err != nil {
@@ -304,7 +304,7 @@ func (c *DiskCache) readSegmentEntries(file *os.File, segID segmentID, entries m
 
 // writeCompactedEntries writes all entries to the output file and updates keydir
 // Returns the total bytes written
-func (c *DiskCache) writeCompactedEntries(file *os.File, outputID segmentID, entries map[string]*compactEntry) (int64, error) {
+func (c *DiskCache[V]) writeCompactedEntries(file *os.File, outputID segmentID, entries map[string]*compactEntry) (int64, error) {
 	writer := bufio.NewWriter(file)
 	offset := int64(fileHeaderSize)
 
@@ -393,7 +393,7 @@ func (c *DiskCache) writeCompactedEntries(file *os.File, outputID segmentID, ent
 }
 
 // writeLogEntryToFile writes a log entry to a buffered writer
-func (c *DiskCache) writeLogEntryToFile(writer *bufio.Writer, entry *logEntry) error {
+func (c *DiskCache[V]) writeLogEntryToFile(writer *bufio.Writer, entry *logEntry) error {
 	// Write header
 	header := make([]byte, headerSize)
 	binary.LittleEndian.PutUint32(header[0:4], entry.crc)
@@ -446,7 +446,7 @@ func (s SegmentID) String() string {
 }
 
 // GetSegmentsByLevel returns segments grouped by level (exported version)
-func (c *DiskCache) GetSegmentsByLevel() (map[uint8][]*SegmentInfo, error) {
+func (c *DiskCache[V]) GetSegmentsByLevel() (map[uint8][]*SegmentInfo, error) {
 	internal, err := c.getSegmentsByLevel()
 	if err != nil {
 		return nil, err

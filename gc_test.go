@@ -43,7 +43,7 @@ func TestCompactWithIntegratedGC(t *testing.T) {
 
 	cache, err := NewDiskCacheWithConfig(tmpDir, DiskCacheConfig{
 		MaxSegmentSize: 1024 * 3, // 3KB segments (smaller = more segments)
-	})
+	}, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestCompactPrioritizesLSMOverGC(t *testing.T) {
 
 	cache, err := NewDiskCacheWithConfig(tmpDir, DiskCacheConfig{
 		MaxSegmentSize: 1024 * 3, // 3KB segments (smaller to create more segments)
-	})
+	}, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -189,7 +189,7 @@ func TestCompactFallsBackToGC(t *testing.T) {
 
 	cache, err := NewDiskCacheWithConfig(tmpDir, DiskCacheConfig{
 		MaxSegmentSize: 1024 * 10, // 10KB segments
-	})
+	}, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}

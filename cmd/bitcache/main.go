@@ -19,8 +19,8 @@ import (
 var (
 	dataDir     string
 	segmentSize int64
-	cache       bitcache.Cache
-	db          *bitcache.DiskCache
+	cache       bitcache.Cache[[]byte]
+	db          *bitcache.DiskCache[[]byte]
 )
 
 var rootCmd = &cobra.Command{
@@ -34,7 +34,7 @@ var rootCmd = &cobra.Command{
 		}
 		// Initialize the database for all other commands
 		var err error
-		db, err = bitcache.NewDiskCache(dataDir)
+		db, err = bitcache.NewDiskCache(dataDir, bitcache.ByteSliceMarshaler{})
 		if err != nil {
 			return fmt.Errorf("failed to open database: %w", err)
 		}
@@ -67,9 +67,9 @@ var setCmd = &cobra.Command{
 		if segmentSize > 0 {
 			db, err = bitcache.NewDiskCacheWithConfig(dataDir, bitcache.DiskCacheConfig{
 				MaxSegmentSize: segmentSize,
-			})
+			}, bitcache.ByteSliceMarshaler{})
 		} else {
-			db, err = bitcache.NewDiskCache(dataDir)
+			db, err = bitcache.NewDiskCache(dataDir, bitcache.ByteSliceMarshaler{})
 		}
 		if err != nil {
 			return fmt.Errorf("failed to open database: %w", err)
@@ -155,9 +155,9 @@ Modes:
 		if segmentSize > 0 {
 			db, err = bitcache.NewDiskCacheWithConfig(dataDir, bitcache.DiskCacheConfig{
 				MaxSegmentSize: segmentSize,
-			})
+			}, bitcache.ByteSliceMarshaler{})
 		} else {
-			db, err = bitcache.NewDiskCache(dataDir)
+			db, err = bitcache.NewDiskCache(dataDir, bitcache.ByteSliceMarshaler{})
 		}
 		if err != nil {
 			return fmt.Errorf("failed to open database: %w", err)
@@ -426,15 +426,14 @@ var statsCmd = &cobra.Command{
 		fmt.Printf("Data size: %.2f MB (%d bytes)\n", float64(stats.DataSize)/(1024*1024), stats.DataSize)
 
 		// Display memory cache statistics if available
-		if mc, ok := cache.(*bitcache.MemCache); ok {
+		if mc, ok := cache.(*bitcache.MemCache[[]byte]); ok {
 			memStats := mc.MemStats()
 			fmt.Println("\n=== Memory Cache Statistics ===")
 			fmt.Printf("Cached entries: %d\n", memStats.Entries)
-			fmt.Printf("Memory used: %.2f MB (%d bytes)\n", float64(memStats.MemoryUsed)/(1024*1024), memStats.MemoryUsed)
-			fmt.Printf("Memory allocated: %.2f MB (%d bytes)\n", float64(memStats.MemoryAllocated)/(1024*1024), memStats.MemoryAllocated)
-			fmt.Printf("Memory limit: %.2f MB (%d bytes)\n", float64(memStats.MemoryLimit)/(1024*1024), memStats.MemoryLimit)
 			fmt.Printf("Shards: %d\n", memStats.Shards)
-			fmt.Printf("Fragmentation: %.2f%%\n", memStats.Fragmentation*100)
+			fmt.Printf("Cache hits: %d\n", memStats.Hits)
+			fmt.Printf("Cache misses: %d\n", memStats.Misses)
+			fmt.Printf("Hit rate: %.2f%%\n", memStats.HitRate*100)
 		}
 
 		return nil
@@ -671,41 +670,14 @@ var replCmd = &cobra.Command{
 				fmt.Printf("  Data size: %.2f MB (%d bytes)\n", float64(stats.DataSize)/(1024*1024), stats.DataSize)
 
 				// Display memory cache statistics if available
-				if mc, ok := cache.(*bitcache.MemCache); ok {
+				if mc, ok := cache.(*bitcache.MemCache[[]byte]); ok {
 					memStats := mc.MemStats()
 					fmt.Println("\nMemory Cache Statistics:")
 					fmt.Printf("  Cached entries: %d\n", memStats.Entries)
-					fmt.Printf("  Memory used: %.2f MB (%d bytes)\n", float64(memStats.MemoryUsed)/(1024*1024), memStats.MemoryUsed)
-					fmt.Printf("  Memory allocated: %.2f MB (%d bytes)\n", float64(memStats.MemoryAllocated)/(1024*1024), memStats.MemoryAllocated)
-					fmt.Printf("  Memory limit: %.2f MB (%d bytes)\n", float64(memStats.MemoryLimit)/(1024*1024), memStats.MemoryLimit)
 					fmt.Printf("  Shards: %d\n", memStats.Shards)
-					fmt.Printf("  Fragmentation: %.2f%%\n", memStats.Fragmentation*100)
-
-					// Display slab breakdown
-					if len(memStats.SlabBreakdown) > 0 {
-						fmt.Println("\n  Slab Breakdown:")
-						// Sort slab sizes for consistent display
-						var sizes []int64
-						for size := range memStats.SlabBreakdown {
-							sizes = append(sizes, size)
-						}
-						// Simple bubble sort for the sizes
-						for i := 0; i < len(sizes); i++ {
-							for j := i + 1; j < len(sizes); j++ {
-								if sizes[i] > sizes[j] {
-									sizes[i], sizes[j] = sizes[j], sizes[i]
-								}
-							}
-						}
-						for _, size := range sizes {
-							count := memStats.SlabBreakdown[size]
-							totalSize := size * int64(count)
-							fmt.Printf("    %s x %d = %s\n",
-								formatBytes(size),
-								count,
-								formatBytes(totalSize))
-						}
-					}
+					fmt.Printf("  Cache hits: %d\n", memStats.Hits)
+					fmt.Printf("  Cache misses: %d\n", memStats.Misses)
+					fmt.Printf("  Hit rate: %.2f%%\n", memStats.HitRate*100)
 				}
 
 			default:
@@ -798,9 +770,9 @@ var benchCmd = &cobra.Command{
 		if benchSegmentSize > 0 {
 			db, err = bitcache.NewDiskCacheWithConfig(dataDir, bitcache.DiskCacheConfig{
 				MaxSegmentSize: benchSegmentSize,
-			})
+			}, bitcache.ByteSliceMarshaler{})
 		} else {
-			db, err = bitcache.NewDiskCache(dataDir)
+			db, err = bitcache.NewDiskCache(dataDir, bitcache.ByteSliceMarshaler{})
 		}
 		if err != nil {
 			return fmt.Errorf("failed to open database: %w", err)

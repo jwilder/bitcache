@@ -1,6 +1,7 @@
 package bitcache
 
 import (
+	"encoding/json"
 	"errors"
 )
 
@@ -11,14 +12,23 @@ var (
 	ErrCacheClosed = errors.New("cache is closed")
 )
 
-// Cache defines the interface for a persistent key-value cache
-type Cache interface {
+// Marshaler defines the interface for converting values to/from byte slices
+// This allows DiskCache to persist Go types in any serialization format
+type Marshaler[V any] interface {
+	// Marshal converts a value to bytes for storage
+	Marshal(value V) ([]byte, error)
+	// Unmarshal converts bytes back to a value
+	Unmarshal(data []byte) (V, error)
+}
+
+// Cache defines the interface for a persistent key-value cache with generic value types
+type Cache[V any] interface {
 	// Get retrieves the value for the given key
 	// Returns ErrKeyNotFound if the key doesn't exist
-	Get(key []byte) ([]byte, error)
+	Get(key []byte) (V, error)
 
 	// Set stores a key-value pair in the cache
-	Set(key []byte, value []byte) error
+	Set(key []byte, value V) error
 
 	// Delete removes a key from the cache
 	// Returns ErrKeyNotFound if the key doesn't exist
@@ -55,4 +65,30 @@ type Stats struct {
 	Deletes int64
 	// Segments is the number of segment files on disk
 	Segments int64
+}
+
+// ByteSliceMarshaler is a no-op marshaler for []byte values
+// Use this when you want to store raw bytes without any encoding
+type ByteSliceMarshaler struct{}
+
+func (ByteSliceMarshaler) Marshal(value []byte) ([]byte, error) {
+	return value, nil
+}
+
+func (ByteSliceMarshaler) Unmarshal(data []byte) ([]byte, error) {
+	return data, nil
+}
+
+// JSONMarshaler marshals values using JSON encoding
+// This is useful for storing structs or other Go types
+type JSONMarshaler[V any] struct{}
+
+func (JSONMarshaler[V]) Marshal(value V) ([]byte, error) {
+	return json.Marshal(value)
+}
+
+func (JSONMarshaler[V]) Unmarshal(data []byte) (V, error) {
+	var value V
+	err := json.Unmarshal(data, &value)
+	return value, err
 }

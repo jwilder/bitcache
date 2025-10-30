@@ -19,7 +19,7 @@ func TestDiskCache_BasicOperations(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create cache
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestDiskCache_Delete(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestDiskCache_Persistence(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create first cache instance and add data
-	cache1, err := NewDiskCache(tmpDir)
+	cache1, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create first cache: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestDiskCache_Persistence(t *testing.T) {
 	}
 
 	// Create second cache instance (should load existing data)
-	cache2, err := NewDiskCache(tmpDir)
+	cache2, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create second cache: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestDiskCache_Stats(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestDiskCache_LargeValues(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestDiskCache_Concurrent(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestDiskCache_Sync(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -348,7 +348,7 @@ func TestDiskCache_ClosedOperations(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestDiskCache_SegmentRollover(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestDiskCache_Compaction(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -574,7 +574,7 @@ func TestDiskCache_HintFiles(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create first cache instance and add data
-	cache1, err := NewDiskCache(tmpDir)
+	cache1, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create first cache: %v", err)
 	}
@@ -604,7 +604,7 @@ func TestDiskCache_HintFiles(t *testing.T) {
 	}
 
 	// Create second cache instance (should load from embedded hints)
-	cache2, err := NewDiskCache(tmpDir)
+	cache2, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create second cache: %v", err)
 	}
@@ -637,7 +637,7 @@ func TestDiskCache_LoadFromHintFiles(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create cache and add data across multiple segments
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -667,7 +667,7 @@ func TestDiskCache_LoadFromHintFiles(t *testing.T) {
 	cache.Close()
 
 	// Create new cache that should load from embedded hints
-	cache2, err := NewDiskCache(tmpDir)
+	cache2, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache from hints: %v", err)
 	}
@@ -700,7 +700,7 @@ func BenchmarkDiskKV_Set(b *testing.B) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		b.Fatalf("Failed to create cache: %v", err)
 	}
@@ -722,7 +722,7 @@ func BenchmarkDiskKV_Get(b *testing.B) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		b.Fatalf("Failed to create cache: %v", err)
 	}
@@ -747,7 +747,7 @@ func BenchmarkDiskKV_SegmentWrites(b *testing.B) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		b.Fatalf("Failed to create cache: %v", err)
 	}
@@ -772,7 +772,7 @@ func BenchmarkDiskKV_CompactionSpeed(b *testing.B) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		b.Fatalf("Failed to create cache: %v", err)
 	}
@@ -814,7 +814,7 @@ func TestDiskCache_NoSegmentCreationOnReopen(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create initial cache and add some data
-	cache1, err := NewDiskCache(tmpDir)
+	cache1, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create first cache: %v", err)
 	}
@@ -842,7 +842,7 @@ func TestDiskCache_NoSegmentCreationOnReopen(t *testing.T) {
 	t.Logf("Initial segment count: %d", initialSegmentCount)
 
 	// Reopen the cache (this should not create new segments)
-	cache2, err := NewDiskCache(tmpDir)
+	cache2, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to reopen cache: %v", err)
 	}
@@ -893,7 +893,7 @@ func TestDiskCache_NoSegmentCreationOnReopen(t *testing.T) {
 			t.Fatalf("Failed to close cache (iteration %d): %v", iteration, err)
 		}
 
-		cache2, err = NewDiskCache(tmpDir)
+		cache2, err = NewDiskCache(tmpDir, ByteSliceMarshaler{})
 		if err != nil {
 			t.Fatalf("Failed to reopen cache (iteration %d): %v", iteration, err)
 		}
@@ -949,7 +949,7 @@ func TestDiskCache_CorruptedRecordInMiddle(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create cache and add data
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -996,7 +996,7 @@ func TestDiskCache_CorruptedRecordInMiddle(t *testing.T) {
 	file.Close()
 
 	// Reopen cache - should recover what it can
-	cache2, err := NewDiskCache(tmpDir)
+	cache2, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to reopen cache: %v", err)
 	}
@@ -1044,7 +1044,7 @@ func TestDiskCache_CorruptedCRC(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create cache and add data
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -1087,7 +1087,7 @@ func TestDiskCache_CorruptedCRC(t *testing.T) {
 	file.Close()
 
 	// Reopen cache - should skip the corrupted record
-	cache2, err := NewDiskCache(tmpDir)
+	cache2, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to reopen cache: %v", err)
 	}
@@ -1143,7 +1143,7 @@ func TestDiskCache_CorruptedHints(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create cache and add data
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -1206,7 +1206,7 @@ func TestDiskCache_CorruptedHints(t *testing.T) {
 	}
 
 	// Reopen cache - should fall back to scanning when hints fail
-	cache2, err := NewDiskCache(tmpDir)
+	cache2, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to reopen cache with corrupted hints: %v", err)
 	}
@@ -1252,7 +1252,7 @@ func TestDiskCache_TruncatedFile(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create cache and add data
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -1295,7 +1295,7 @@ func TestDiskCache_TruncatedFile(t *testing.T) {
 	file.Close()
 
 	// Reopen cache - should recover partial data
-	cache2, err := NewDiskCache(tmpDir)
+	cache2, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to reopen cache: %v", err)
 	}
@@ -1341,7 +1341,7 @@ func TestDiskCache_MultipleCorruptions(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create cache and add data across multiple segments
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -1397,7 +1397,7 @@ func TestDiskCache_MultipleCorruptions(t *testing.T) {
 	}
 
 	// Reopen cache
-	cache2, err := NewDiskCache(tmpDir)
+	cache2, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to reopen cache with multiple corruptions: %v", err)
 	}
@@ -1444,7 +1444,7 @@ func TestDiskCache_CorruptedHeader(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create cache and add data
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -1486,7 +1486,7 @@ func TestDiskCache_CorruptedHeader(t *testing.T) {
 	file.Close()
 
 	// Reopen cache - should handle corrupted header gracefully
-	cache2, err := NewDiskCache(tmpDir)
+	cache2, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to reopen cache with corrupted header: %v", err)
 	}
@@ -1533,7 +1533,7 @@ func TestDiskCache_PartialRecordWrite(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Create cache and add data
-	cache, err := NewDiskCache(tmpDir)
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -1578,7 +1578,7 @@ func TestDiskCache_PartialRecordWrite(t *testing.T) {
 	file.Close()
 
 	// Reopen cache - should recover complete records only
-	cache2, err := NewDiskCache(tmpDir)
+	cache2, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to reopen cache: %v", err)
 	}
@@ -1617,7 +1617,7 @@ func TestDiskCache_Scan_OrderedKeys(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 
-	cache, err := NewDiskCache(dir)
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -1681,7 +1681,7 @@ func TestDiskCache_Scan_PrefixOrderedKeys(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 
-	cache, err := NewDiskCache(dir)
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -1768,7 +1768,7 @@ func TestDiskCache_Scan_OrderWithDeletes(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 
-	cache, err := NewDiskCache(dir)
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -1828,7 +1828,7 @@ func TestDiskCache_Scan_EarlyTermination(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 
-	cache, err := NewDiskCache(dir)
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}
@@ -1872,7 +1872,7 @@ func TestDiskCache_Scan_LargeDataset(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 
-	cache, err := NewDiskCache(dir)
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to create cache: %v", err)
 	}

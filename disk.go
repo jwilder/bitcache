@@ -52,7 +52,7 @@ type cachedFile struct {
 // The structure implements the Cache interface (see cache.go) and is intended
 // for workloads where the full key index fits in memory and fast point lookups
 // are required, while values are stored on disk.
-type DiskCache struct {
+type DiskCache[V any] struct {
 	mu              sync.RWMutex
 	dir             string
 	activeFile      *os.File
@@ -70,6 +70,8 @@ type DiskCache struct {
 	fileCacheMutex sync.RWMutex
 	// Configuration
 	maxSegmentSize int64
+	// Marshaling
+	marshaler Marshaler[V]
 }
 
 // DiskCacheConfig holds configuration options for DiskCache
@@ -126,13 +128,13 @@ const (
 	minCompactionInterval = time.Hour
 )
 
-// NewDiskCache creates a new bitcask cache in the specified directory
-func NewDiskCache(dir string) (*DiskCache, error) {
-	return NewDiskCacheWithConfig(dir, DiskCacheConfig{})
+// NewDiskCache creates a new bitcask cache in the specified directory with a marshaler
+func NewDiskCache[V any](dir string, marshaler Marshaler[V]) (*DiskCache[V], error) {
+	return NewDiskCacheWithConfig(dir, DiskCacheConfig{}, marshaler)
 }
 
-// NewDiskCacheWithConfig creates a new bitcask cache with custom configuration
-func NewDiskCacheWithConfig(dir string, config DiskCacheConfig) (*DiskCache, error) {
+// NewDiskCacheWithConfig creates a new bitcask cache with custom configuration and marshaler
+func NewDiskCacheWithConfig[V any](dir string, config DiskCacheConfig, marshaler Marshaler[V]) (*DiskCache[V], error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
@@ -143,11 +145,12 @@ func NewDiskCacheWithConfig(dir string, config DiskCacheConfig) (*DiskCache, err
 		maxSegSize = maxFileSize
 	}
 
-	cache := &DiskCache{
+	cache := &DiskCache[V]{
 		dir: dir,
 		// Initialize the file cache
 		fileCache:      make(map[uint32]*cachedFile),
 		maxSegmentSize: maxSegSize,
+		marshaler:      marshaler,
 	}
 
 	// Initialize the keydir with an empty btree
@@ -168,22 +171,23 @@ func NewDiskCacheWithConfig(dir string, config DiskCacheConfig) (*DiskCache, err
 }
 
 // isClosed checks if the cache is closed (lock-free)
-func (c *DiskCache) isClosed() bool {
+func (c *DiskCache[V]) isClosed() bool {
 	return c.closed.Load()
 }
 
 // Get retrieves the value for the given key
-func (c *DiskCache) Get(key []byte) ([]byte, error) {
+func (c *DiskCache[V]) Get(key []byte) (V, error) {
+	var zero V
 	// Check closed status with minimal locking
 	if c.isClosed() {
-		return nil, ErrCacheClosed
+		return zero, ErrCacheClosed
 	}
 
 	// Lock-free keydir read using atomic pointer
 	keyStr := string(key)
 	entry, exists := c.getKeyEntry(keyStr)
 	if !exists || entry.deleted {
-		return nil, ErrKeyNotFound
+		return zero, ErrKeyNotFound
 	}
 
 	// Check if we need to flush the active writer (only if reading from active file)
@@ -208,7 +212,7 @@ func (c *DiskCache) Get(key []byte) ([]byte, error) {
 		if c.activeWriter != nil {
 			if err := c.activeWriter.Flush(); err != nil {
 				c.mu.Unlock()
-				return nil, fmt.Errorf("failed to flush active writer: %w", err)
+				return zero, fmt.Errorf("failed to flush active writer: %w", err)
 			}
 		}
 		c.mu.Unlock()
@@ -216,35 +220,47 @@ func (c *DiskCache) Get(key []byte) ([]byte, error) {
 
 	// Final closed check before disk I/O
 	if c.isClosed() {
-		return nil, ErrCacheClosed
+		return zero, ErrCacheClosed
 	}
 
 	atomic.AddInt64(&c.stats.Reads, 1)
 
 	// Read the value from disk WITHOUT holding any cache-level locks
 	// File caching has its own fine-grained locks
-	value, err := c.readValueFromDisk(entry)
+	data, err := c.readValueFromDisk(entry)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read value: %w", err)
+		return zero, fmt.Errorf("failed to read value: %w", err)
+	}
+
+	// Unmarshal the bytes to the target type
+	value, err := c.marshaler.Unmarshal(data)
+	if err != nil {
+		return zero, fmt.Errorf("failed to unmarshal value: %w", err)
 	}
 
 	return value, nil
 }
 
 // Set stores a key-value pair in the cache
-func (c *DiskCache) Set(key []byte, value []byte) error {
+func (c *DiskCache[V]) Set(key []byte, value V) error {
 	// Quick closed check without lock
 	if c.isClosed() {
 		return ErrCacheClosed
+	}
+
+	// Marshal the value to bytes
+	data, err := c.marshaler.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("failed to marshal value: %w", err)
 	}
 
 	// Prepare entry and calculate CRC WITHOUT holding any lock
 	entry := &logEntry{
 		timestamp: uint32(time.Now().Unix()),
 		keySize:   uint32(len(key)),
-		valueSize: uint32(len(value)),
+		valueSize: uint32(len(data)),
 		key:       key,
-		value:     value,
+		value:     data,
 		deleted:   false,
 	}
 	entry.crc = c.calculateCRC(entry)
@@ -293,7 +309,7 @@ func (c *DiskCache) Set(key []byte, value []byte) error {
 }
 
 // Delete removes a key from the cache
-func (c *DiskCache) Delete(key []byte) error {
+func (c *DiskCache[V]) Delete(key []byte) error {
 	// Quick closed check without lock
 	if c.isClosed() {
 		return ErrCacheClosed
@@ -362,7 +378,7 @@ func (c *DiskCache) Delete(key []byte) error {
 }
 
 // Has checks if a key exists in the cache
-func (c *DiskCache) Has(key []byte) bool {
+func (c *DiskCache[V]) Has(key []byte) bool {
 	if c.isClosed() {
 		return false
 	}
@@ -374,7 +390,7 @@ func (c *DiskCache) Has(key []byte) bool {
 }
 
 // Close closes the cache and flushes any pending writes
-func (c *DiskCache) Close() error {
+func (c *DiskCache[V]) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -413,7 +429,7 @@ func (c *DiskCache) Close() error {
 }
 
 // Sync forces a sync of any pending writes to disk
-func (c *DiskCache) Sync() error {
+func (c *DiskCache[V]) Sync() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -437,7 +453,7 @@ func (c *DiskCache) Sync() error {
 }
 
 // Stats returns cache statistics
-func (c *DiskCache) Stats() Stats {
+func (c *DiskCache[V]) Stats() Stats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -464,7 +480,7 @@ func (c *DiskCache) Stats() Stats {
 
 // Scan iterates through all keys with the given prefix and calls the function for each key
 // The function should return true to stop iteration, false to continue
-func (c *DiskCache) Scan(prefix []byte, fn func(key []byte) bool) error {
+func (c *DiskCache[V]) Scan(prefix []byte, fn func(key []byte) bool) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -514,7 +530,7 @@ func (c *DiskCache) Scan(prefix []byte, fn func(key []byte) bool) error {
 }
 
 // loadFromDisk loads existing data files and rebuilds the keydir
-func (c *DiskCache) loadFromDisk() error {
+func (c *DiskCache[V]) loadFromDisk() error {
 	// Try to load from segment files with embedded hints first
 	if err := c.loadFromSegmentFiles(); err == nil {
 		return nil
@@ -539,7 +555,7 @@ func (c *DiskCache) loadFromDisk() error {
 }
 
 // loadFromSegmentFiles attempts to load keydir from segment files with embedded hints
-func (c *DiskCache) loadFromSegmentFiles() error {
+func (c *DiskCache[V]) loadFromSegmentFiles() error {
 	files, err := filepath.Glob(filepath.Join(c.dir, "*.log"))
 	if err != nil {
 		return err
@@ -578,7 +594,7 @@ func (c *DiskCache) loadFromSegmentFiles() error {
 }
 
 // loadSegmentFile loads keydir entries from a segment file with embedded hints
-func (c *DiskCache) loadSegmentFile(filename string, fileID uint32) error {
+func (c *DiskCache[V]) loadSegmentFile(filename string, fileID uint32) error {
 	file, err := os.Open(filename)
 	if err != nil {
 		return err
@@ -620,7 +636,7 @@ func (c *DiskCache) loadSegmentFile(filename string, fileID uint32) error {
 }
 
 // readFileHeader reads the file header from the beginning of a segment file
-func (c *DiskCache) readFileHeader(file *os.File) (*fileHeader, error) {
+func (c *DiskCache[V]) readFileHeader(file *os.File) (*fileHeader, error) {
 	// Seek to beginning of file
 	if _, err := file.Seek(0, 0); err != nil {
 		return nil, err
@@ -659,7 +675,7 @@ func (c *DiskCache) readFileHeader(file *os.File) (*fileHeader, error) {
 }
 
 // writeFileHeader writes the file header to the beginning of a segment file
-func (c *DiskCache) writeFileHeader(file *os.File, header *fileHeader) error {
+func (c *DiskCache[V]) writeFileHeader(file *os.File, header *fileHeader) error {
 	// Seek to beginning of file
 	if _, err := file.Seek(0, 0); err != nil {
 		return err
@@ -673,7 +689,7 @@ func (c *DiskCache) writeFileHeader(file *os.File, header *fileHeader) error {
 }
 
 // loadHintsFromSegment loads keydir entries from hints embedded in a segment file
-func (c *DiskCache) loadHintsFromSegment(file *os.File, hintOffset int64, fileID uint32) error {
+func (c *DiskCache[V]) loadHintsFromSegment(file *os.File, hintOffset int64, fileID uint32) error {
 	// Seek to hint section
 	if _, err := file.Seek(hintOffset, 0); err != nil {
 		return err
@@ -768,7 +784,7 @@ func (c *DiskCache) loadHintsFromSegment(file *os.File, hintOffset int64, fileID
 }
 
 // scanSegmentFile scans a segment file to build the keydir (fallback when no hints)
-func (c *DiskCache) scanSegmentFile(file *os.File, fileID uint32) error {
+func (c *DiskCache[V]) scanSegmentFile(file *os.File, fileID uint32) error {
 	// Start after the file header
 	if _, err := file.Seek(fileHeaderSize, 0); err != nil {
 		return err
@@ -839,7 +855,7 @@ func (c *DiskCache) scanSegmentFile(file *os.File, fileID uint32) error {
 
 // tryFindNextRecord attempts to find the next valid record after a corruption point
 // Returns the offset of the next potential valid record, or the same offset if none found
-func (c *DiskCache) tryFindNextRecord(file *os.File, currentOffset int64) int64 {
+func (c *DiskCache[V]) tryFindNextRecord(file *os.File, currentOffset int64) int64 {
 	// Get file size to avoid reading beyond EOF
 	stat, err := file.Stat()
 	if err != nil {
@@ -872,7 +888,7 @@ func (c *DiskCache) tryFindNextRecord(file *os.File, currentOffset int64) int64 
 }
 
 // validateRecordAtOffset checks if there's a valid record at the given offset
-func (c *DiskCache) validateRecordAtOffset(file *os.File, offset int64, fileSize int64) bool {
+func (c *DiskCache[V]) validateRecordAtOffset(file *os.File, offset int64, fileSize int64) bool {
 	// Try to read a header at this position
 	if _, err := file.Seek(offset, 0); err != nil {
 		return false
@@ -914,7 +930,7 @@ func (c *DiskCache) validateRecordAtOffset(file *os.File, offset int64, fileSize
 }
 
 // openLogFile opens the current log file for appending
-func (c *DiskCache) openLogFile() error {
+func (c *DiskCache[V]) openLogFile() error {
 	if err := os.MkdirAll(c.dir, 0755); err != nil {
 		return err
 	}
@@ -963,7 +979,7 @@ func (c *DiskCache) openLogFile() error {
 }
 
 // writeLogEntry writes a log entry to the current log file
-func (c *DiskCache) writeLogEntry(entry *logEntry) (int64, error) {
+func (c *DiskCache[V]) writeLogEntry(entry *logEntry) (int64, error) {
 	// Check if we need to rotate to a new file
 	entrySize := headerSize + int64(entry.keySize) + int64(entry.valueSize)
 	if c.activeOffset+entrySize > c.maxSegmentSize {
@@ -1008,7 +1024,7 @@ func (c *DiskCache) writeLogEntry(entry *logEntry) (int64, error) {
 }
 
 // rotateLogFile creates a new log file and writes hints to the old one
-func (c *DiskCache) rotateLogFile() error {
+func (c *DiskCache[V]) rotateLogFile() error {
 	// Before closing the current file, write hints to it
 	if c.activeFile != nil && c.activeWriter != nil {
 		oldFileID := c.activeFileID
@@ -1056,7 +1072,7 @@ func (c *DiskCache) rotateLogFile() error {
 
 // writeHintsToActiveFile appends hints to the active file and updates its header
 // This must be called after flushing the activeWriter and before closing the file
-func (c *DiskCache) writeHintsToActiveFile(fileID uint32, hintOffset int64) error {
+func (c *DiskCache[V]) writeHintsToActiveFile(fileID uint32, hintOffset int64) error {
 	// Write all hints for this file to the active writer
 	tree := c.keydir.Load()
 	if tree != nil {
@@ -1101,7 +1117,7 @@ func (c *DiskCache) writeHintsToActiveFile(fileID uint32, hintOffset int64) erro
 }
 
 // loadLogFile loads a single log file and updates the keydir (fallback method)
-func (c *DiskCache) loadLogFile(filename string) error {
+func (c *DiskCache[V]) loadLogFile(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
 		return err
@@ -1168,7 +1184,7 @@ func (c *DiskCache) loadLogFile(filename string) error {
 }
 
 // compactSegment processes a single segment file
-func (c *DiskCache) compactSegment(fileID uint32) error {
+func (c *DiskCache[V]) compactSegment(fileID uint32) error {
 	// Try LSM format first, then legacy
 	filename := filepath.Join(c.dir, fmt.Sprintf("%08d-00.log", fileID))
 	file, err := os.Open(filename)
@@ -1243,11 +1259,18 @@ func (c *DiskCache) compactSegment(fileID uint32) error {
 			!currentEntry.deleted
 
 		if isLatest {
-			// This is the latest version, write it to the active file using Set
+			// This is the latest version, unmarshal then write it to the active file
 			// We need to unlock the compaction mutex temporarily to avoid deadlock
 			// since Set also needs to take the write lock
+			value, err := c.marshaler.Unmarshal(entry.value)
+			if err != nil {
+				// Skip corrupted entries
+				offset += int64(entrySize)
+				continue
+			}
+
 			c.compactionMutex.Unlock()
-			err := c.Set(entry.key, entry.value)
+			err = c.Set(entry.key, value)
 			c.compactionMutex.Lock()
 
 			if err != nil {
@@ -1273,7 +1296,7 @@ func (c *DiskCache) compactSegment(fileID uint32) error {
 }
 
 // readValueFromDisk reads a value from disk given a key entry using cached file handles
-func (c *DiskCache) readValueFromDisk(entry *keyEntry) ([]byte, error) {
+func (c *DiskCache[V]) readValueFromDisk(entry *keyEntry) ([]byte, error) {
 	cachedFile, err := c.getCachedFile(entry.fileID)
 	if err != nil {
 		return nil, err
@@ -1305,7 +1328,7 @@ func (c *DiskCache) readValueFromDisk(entry *keyEntry) ([]byte, error) {
 }
 
 // getCachedFile returns a cached file handle for the given file ID
-func (c *DiskCache) getCachedFile(fileID uint32) (*cachedFile, error) {
+func (c *DiskCache[V]) getCachedFile(fileID uint32) (*cachedFile, error) {
 	c.fileCacheMutex.RLock()
 	cached, exists := c.fileCache[fileID]
 	c.fileCacheMutex.RUnlock()
@@ -1357,7 +1380,7 @@ func (c *DiskCache) getCachedFile(fileID uint32) (*cachedFile, error) {
 }
 
 // removeCachedFile removes a file from the cache and closes it
-func (c *DiskCache) removeCachedFile(fileID uint32) error {
+func (c *DiskCache[V]) removeCachedFile(fileID uint32) error {
 	c.fileCacheMutex.Lock()
 	defer c.fileCacheMutex.Unlock()
 
@@ -1380,7 +1403,7 @@ func (c *DiskCache) removeCachedFile(fileID uint32) error {
 }
 
 // readLogEntry reads a complete log entry from a reader
-func (c *DiskCache) readLogEntry(reader *bufio.Reader) (*logEntry, int, error) {
+func (c *DiskCache[V]) readLogEntry(reader *bufio.Reader) (*logEntry, int, error) {
 	// Read header
 	header := make([]byte, headerSize)
 	if _, err := io.ReadFull(reader, header); err != nil {
@@ -1420,7 +1443,7 @@ func (c *DiskCache) readLogEntry(reader *bufio.Reader) (*logEntry, int, error) {
 }
 
 // calculateCRC calculates the CRC32 checksum for a log entry
-func (c *DiskCache) calculateCRC(entry *logEntry) uint32 {
+func (c *DiskCache[V]) calculateCRC(entry *logEntry) uint32 {
 	crc := crc32.NewIEEE()
 
 	// Include timestamp, key size, value size, and deleted flag
@@ -1446,7 +1469,7 @@ func (c *DiskCache) calculateCRC(entry *logEntry) uint32 {
 // It checks all levels (L0 through L4) and compacts the level that needs it most.
 // If no LSM compaction is needed, it performs garbage collection on segments with high dead ratios.
 // Returns CompactionResult with details about what was compacted, or a result with Type="none" if no compaction was needed.
-func (c *DiskCache) Compact() (*CompactionResult, error) {
+func (c *DiskCache[V]) Compact() (*CompactionResult, error) {
 	if c == nil {
 		return &CompactionResult{Type: "none"}, nil
 	}
@@ -1508,7 +1531,7 @@ func (c *DiskCache) Compact() (*CompactionResult, error) {
 // compactGarbageLocked performs garbage collection on a single segment with high dead ratio
 // This is called by Compact() when no LSM compaction is needed
 // GC only runs on L4 segments to avoid creating churn at lower levels
-func (c *DiskCache) compactGarbageLocked(byLevel map[uint8][]*segmentInfo) (*CompactionResult, error) {
+func (c *DiskCache[V]) compactGarbageLocked(byLevel map[uint8][]*segmentInfo) (*CompactionResult, error) {
 	// GC configuration for automatic compaction
 	// Only runs on L4 (max level) to prevent churn from creating new L0 segments
 	const (
@@ -1569,7 +1592,7 @@ func (c *DiskCache) compactGarbageLocked(byLevel map[uint8][]*segmentInfo) (*Com
 }
 
 // compactLevelLSMLocked is the internal version that assumes the lock is already held
-func (c *DiskCache) compactLevelLSMLocked(sourceLevel uint8, batchSize int, byLevel map[uint8][]*segmentInfo) (*CompactionResult, error) {
+func (c *DiskCache[V]) compactLevelLSMLocked(sourceLevel uint8, batchSize int, byLevel map[uint8][]*segmentInfo) (*CompactionResult, error) {
 	if c.isClosed() {
 		return nil, ErrCacheClosed
 	}
@@ -1634,7 +1657,7 @@ func (c *DiskCache) compactLevelLSMLocked(sourceLevel uint8, batchSize int, byLe
 
 // compactLevel4Locked merges all L4 segments into a single L4 segment (garbage collection)
 // This assumes the compaction lock is already held
-func (c *DiskCache) compactLevel4Locked(segments []*segmentInfo) (*CompactionResult, error) {
+func (c *DiskCache[V]) compactLevel4Locked(segments []*segmentInfo) (*CompactionResult, error) {
 	if len(segments) < 2 {
 		return &CompactionResult{Type: "none"}, nil
 	}
@@ -1685,7 +1708,7 @@ func (c *DiskCache) compactLevel4Locked(segments []*segmentInfo) (*CompactionRes
 }
 
 // getSegments retrieves the list of segments (log files) to be compacted
-func (c *DiskCache) getSegments() ([]*keyEntry, error) {
+func (c *DiskCache[V]) getSegments() ([]*keyEntry, error) {
 	files, err := filepath.Glob(filepath.Join(c.dir, "*.log"))
 	if err != nil {
 		return nil, err
@@ -1713,7 +1736,7 @@ func (c *DiskCache) getSegments() ([]*keyEntry, error) {
 }
 
 // getFileID extracts the file ID from the log file name
-func (c *DiskCache) getFileID(filename string) (uint32, error) {
+func (c *DiskCache[V]) getFileID(filename string) (uint32, error) {
 	return parseFileID(filename)
 }
 
@@ -1744,7 +1767,7 @@ func parseFileID(filename string) (uint32, error) {
 }
 
 // readHintEntry reads a hint entry from the hint data
-func (c *DiskCache) readHintEntry(reader *bufio.Reader) (*hintEntry, error) {
+func (c *DiskCache[V]) readHintEntry(reader *bufio.Reader) (*hintEntry, error) {
 	// Read header
 	header := make([]byte, hintHeaderSize)
 	if _, err := io.ReadFull(reader, header); err != nil {
@@ -1768,7 +1791,7 @@ func (c *DiskCache) readHintEntry(reader *bufio.Reader) (*hintEntry, error) {
 }
 
 // writeHintEntry writes a hint entry to the hint data
-func (c *DiskCache) writeHintEntry(writer *bufio.Writer, entry *hintEntry) error {
+func (c *DiskCache[V]) writeHintEntry(writer *bufio.Writer, entry *hintEntry) error {
 	// Write header
 	header := make([]byte, hintHeaderSize)
 	binary.LittleEndian.PutUint32(header[0:4], entry.timestamp)
@@ -1789,7 +1812,7 @@ func (c *DiskCache) writeHintEntry(writer *bufio.Writer, entry *hintEntry) error
 }
 
 // getKeyEntry retrieves a keyEntry from the key directory
-func (c *DiskCache) getKeyEntry(key string) (*keyEntry, bool) {
+func (c *DiskCache[V]) getKeyEntry(key string) (*keyEntry, bool) {
 	tree := c.keydir.Load()
 	if tree == nil {
 		return nil, false
@@ -1800,7 +1823,7 @@ func (c *DiskCache) getKeyEntry(key string) (*keyEntry, bool) {
 }
 
 // setKeyEntry sets a keyEntry in the key directory
-func (c *DiskCache) setKeyEntry(key string, entry *keyEntry) {
+func (c *DiskCache[V]) setKeyEntry(key string, entry *keyEntry) {
 	c.keydirMu.Lock()
 	defer c.keydirMu.Unlock()
 

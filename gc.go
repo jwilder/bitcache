@@ -39,7 +39,7 @@ func DefaultGCConfig() GCConfig {
 }
 
 // scanSegmentForGC scans a segment to calculate live vs dead data
-func (c *DiskCache) scanSegmentForGC(fileID uint32, segmentPath string) (SegmentGCInfo, error) {
+func (c *DiskCache[V]) scanSegmentForGC(fileID uint32, segmentPath string) (SegmentGCInfo, error) {
 	file, err := os.Open(segmentPath)
 	if err != nil {
 		return SegmentGCInfo{}, err
@@ -116,7 +116,7 @@ func (c *DiskCache) scanSegmentForGC(fileID uint32, segmentPath string) (Segment
 }
 
 // getAllSegmentFiles returns all segment file paths
-func (c *DiskCache) getAllSegmentFiles() ([]string, error) {
+func (c *DiskCache[V]) getAllSegmentFiles() ([]string, error) {
 	pattern := filepath.Join(c.dir, "*.log")
 	files, err := filepath.Glob(pattern)
 	if err != nil {
@@ -126,7 +126,7 @@ func (c *DiskCache) getAllSegmentFiles() ([]string, error) {
 }
 
 // getSegmentPath returns the file path for a given file ID
-func (c *DiskCache) getSegmentPath(fileID uint32) string {
+func (c *DiskCache[V]) getSegmentPath(fileID uint32) string {
 	// Try LSM format first (check all levels)
 	for level := uint8(0); level <= 4; level++ {
 		path := filepath.Join(c.dir, fmt.Sprintf("%08d-%02d.log", fileID, level))
@@ -148,7 +148,7 @@ func parseFileIDFromPath(path string) (uint32, error) {
 // readLogEntryAt reads a log entry at a specific offset and returns the entry and its size
 // If entry is nil, a new one will be allocated. Otherwise, the provided entry is reused.
 // If skipValue is true, the value field is not read (saves memory for scans that only need keys)
-func (c *DiskCache) readLogEntryAt(entry *logEntry, file *os.File, offset int64, skipValue bool) (*logEntry, int64, error) {
+func (c *DiskCache[V]) readLogEntryAt(entry *logEntry, file *os.File, offset int64, skipValue bool) (*logEntry, int64, error) {
 	if _, err := file.Seek(offset, io.SeekStart); err != nil {
 		return nil, 0, err
 	}
@@ -213,7 +213,7 @@ func (c *DiskCache) readLogEntryAt(entry *logEntry, file *os.File, offset int64,
 // GetGCStats returns statistics about garbage collection
 // Since background GC has been removed (GC is now handled via Compact),
 // this returns the current segment statistics by scanning all segments
-func (c *DiskCache) GetGCStats() GCStats {
+func (c *DiskCache[V]) GetGCStats() GCStats {
 	segments, err := c.scanAllSegments()
 	if err != nil {
 		return GCStats{}
@@ -227,7 +227,7 @@ func (c *DiskCache) GetGCStats() GCStats {
 
 // scanAllSegments scans all segments and returns their GC statistics
 // This is used internally by GetGCStats
-func (c *DiskCache) scanAllSegments() ([]SegmentGCInfo, error) {
+func (c *DiskCache[V]) scanAllSegments() ([]SegmentGCInfo, error) {
 	if c.isClosed() {
 		return nil, ErrCacheClosed
 	}
