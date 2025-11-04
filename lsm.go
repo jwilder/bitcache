@@ -107,42 +107,35 @@ func DefaultLSMCompactionConfig() LSMCompactionConfig {
 }
 
 // getSegmentsByLevel returns segments grouped by level, sorted by generation within each level
+// This uses in-memory segment tracking for efficiency instead of listing files from disk
 func (c *DiskCache[V]) getSegmentsByLevel() (map[uint8][]*segmentInfo, error) {
-	files, err := filepath.Glob(filepath.Join(c.dir, "*.log"))
-	if err != nil {
-		return nil, err
-	}
-
 	// Get active file ID to skip it
 	c.mu.RLock()
 	activeID := c.activeFileID
 	c.mu.RUnlock()
 
+	// Read from in-memory segment tracking
+	c.segmentsMutex.RLock()
+	defer c.segmentsMutex.RUnlock()
+
 	byLevel := make(map[uint8][]*segmentInfo)
 
-	for _, path := range files {
-		id, err := parseSegmentID(path)
-		if err != nil {
-			continue
-		}
-
+	for id, info := range c.segments {
 		// Skip active segment (compare generation to activeFileID)
 		if id.generation == activeID {
 			continue
 		}
 
-		stat, err := os.Stat(path)
-		if err != nil {
-			continue
+		// Create a copy of the segment info to avoid data races
+		infoCopy := &segmentInfo{
+			id:         info.id,
+			path:       info.path,
+			liveKeys:   info.liveKeys,
+			liveBytes:  info.liveBytes,
+			totalBytes: info.totalBytes,
 		}
 
-		info := &segmentInfo{
-			id:         id,
-			path:       path,
-			totalBytes: stat.Size(),
-		}
-
-		byLevel[id.level] = append(byLevel[id.level], info)
+		byLevel[id.level] = append(byLevel[id.level], infoCopy)
 	}
 
 	// Sort segments within each level by generation (oldest first)
@@ -203,13 +196,20 @@ type compactEntry struct {
 // Returns the number of live entries and bytes written
 func (c *DiskCache[V]) compactSegmentsToLevel(segments []*segmentInfo, outputID segmentID) (int, int64, error) {
 	outputPath := filepath.Join(c.dir, outputID.String())
+	tmpPath := outputPath + ".tmp"
 
-	// Open output file
-	outputFile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	// Open temporary output file
+	outputFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to create output file: %w", err)
+		return 0, 0, fmt.Errorf("failed to create temporary output file: %w", err)
 	}
-	defer outputFile.Close()
+	defer func() {
+		outputFile.Close()
+		// Clean up temporary file if we're returning with an error
+		if err != nil {
+			os.Remove(tmpPath)
+		}
+	}()
 
 	// Write file header
 	header := &fileHeader{hintOffset: 0}
@@ -239,6 +239,21 @@ func (c *DiskCache[V]) compactSegmentsToLevel(segments []*segmentInfo, outputID 
 	bytesWritten, err := c.writeCompactedEntries(outputFile, outputID, entries)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to write entries: %w", err)
+	}
+
+	// Fsync the temporary file to ensure it's durably written
+	if err := outputFile.Sync(); err != nil {
+		return 0, 0, fmt.Errorf("failed to fsync temporary output file: %w", err)
+	}
+
+	// Close the file before renaming
+	if err := outputFile.Close(); err != nil {
+		return 0, 0, fmt.Errorf("failed to close temporary output file: %w", err)
+	}
+
+	// Rename temporary file to final name (atomic operation)
+	if err := os.Rename(tmpPath, outputPath); err != nil {
+		return 0, 0, fmt.Errorf("failed to rename temporary file to final output: %w", err)
 	}
 
 	return len(entries), bytesWritten, nil
@@ -274,6 +289,7 @@ func (c *DiskCache[V]) readSegmentEntries(file *os.File, segID segmentID, entrie
 		}
 
 		if entry.deleted {
+			c.releaseLogEntry(entry)
 			offset += int64(entrySize)
 			continue
 		}
@@ -286,16 +302,22 @@ func (c *DiskCache[V]) readSegmentEntries(file *os.File, segID segmentID, entrie
 			currentEntry.fileID == segID.generation &&
 			currentEntry.offset == offset &&
 			!currentEntry.deleted {
-			// This is still the live version
+			// This is still the live version - make copies since we're releasing the entry
+			keyCopy := make([]byte, len(entry.key))
+			copy(keyCopy, entry.key)
+			valueCopy := make([]byte, len(entry.value))
+			copy(valueCopy, entry.value)
+
 			entries[keyStr] = &compactEntry{
-				key:       entry.key,
-				value:     entry.value,
+				key:       keyCopy,
+				value:     valueCopy,
 				timestamp: entry.timestamp,
 				offset:    offset,
 				fileID:    segID.generation,
 			}
 		}
 
+		c.releaseLogEntry(entry)
 		offset += int64(entrySize)
 	}
 
@@ -384,11 +406,7 @@ func (c *DiskCache[V]) writeCompactedEntries(file *os.File, outputID segmentID, 
 		return 0, err
 	}
 
-	// Sync to disk
-	if err := file.Sync(); err != nil {
-		return 0, err
-	}
-
+	// Note: Sync is handled by the caller after writing is complete
 	return offset, nil
 }
 

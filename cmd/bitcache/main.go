@@ -441,7 +441,6 @@ var statsCmd = &cobra.Command{
 }
 
 var (
-	scanPrefix    string
 	compactList   bool
 	compactDryRun bool
 	compactGC     bool
@@ -450,21 +449,30 @@ var (
 
 var scanCmd = &cobra.Command{
 	Use:   "scan",
-	Short: "Scan and print keys with optional prefix filter",
-	Long:  `Iterate through all keys in the database and print them. Optionally filter by prefix.`,
+	Short: "Scan and print all keys in physical order",
+	Long:  `Iterate through all keys in the database in physical order and print them. Deleted entries are shown with "yes" in the Deleted column.`,
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		fmt.Println("Scanning all keys...")
+		fmt.Println()
+
+		// Print table header
+		fmt.Printf("%-60s\t%s\n", "Key", "Deleted")
+		fmt.Printf("%s\t%s\n", strings.Repeat("-", 60), strings.Repeat("-", 10))
+
 		count := 0
-		prefix := []byte(scanPrefix)
+		deletedCount := 0
+		err := cache.Scan(func(key []byte, value []byte) bool {
+			deleted := "no"
+			if value == nil {
+				deleted = "yes"
+				deletedCount++
+			}
 
-		if len(prefix) > 0 {
-			fmt.Printf("Scanning keys with prefix: %q\n", scanPrefix)
-		} else {
-			fmt.Println("Scanning all keys...")
-		}
+			// Convert key to printable string, escaping non-printable characters
+			keyStr := formatPrintableKey(key, 60)
 
-		err := cache.Scan(prefix, func(key []byte) bool {
-			fmt.Printf("%s\n", string(key))
+			fmt.Printf("%-60s\t%s\n", keyStr, deleted)
 			count++
 			return false // continue iteration
 		})
@@ -473,9 +481,39 @@ var scanCmd = &cobra.Command{
 			return fmt.Errorf("scan failed: %w", err)
 		}
 
-		fmt.Printf("\nTotal keys found: %d\n", count)
+		fmt.Println()
+		fmt.Printf("Total entries: %d (%d live, %d deleted)\n", count, count-deletedCount, deletedCount)
 		return nil
 	},
+}
+
+// formatPrintableKey converts a byte slice key to a printable string,
+// escaping non-printable characters as \xHH and truncating if needed
+func formatPrintableKey(key []byte, maxLen int) string {
+	var result strings.Builder
+	result.Grow(len(key)) // Pre-allocate approximate size
+
+	for _, b := range key {
+		// Check if byte is printable (space through tilde in ASCII)
+		if b >= 32 && b <= 126 {
+			result.WriteByte(b)
+		} else {
+			// Escape non-printable bytes as \xHH
+			result.WriteString(fmt.Sprintf("\\x%02x", b))
+		}
+
+		// Stop if we've exceeded max length (accounting for escape sequences)
+		if result.Len() > maxLen-3 {
+			result.WriteString("...")
+			break
+		}
+	}
+
+	str := result.String()
+	if len(str) > maxLen {
+		return str[:maxLen-3] + "..."
+	}
+	return str
 }
 
 var verifyCmd = &cobra.Command{
@@ -553,8 +591,8 @@ var replCmd = &cobra.Command{
 		fmt.Println("Type 'help' for available commands, 'exit' or 'quit' to exit")
 		fmt.Println()
 
-		cache.Scan(nil, func(key []byte) bool {
-			cache.Get(key)
+		cache.Scan(func(key []byte, value []byte) bool {
+			// Warmup: just accessing the keys is enough
 			return false
 		})
 
@@ -587,7 +625,7 @@ var replCmd = &cobra.Command{
 				fmt.Println("  get <key>           - Get value for key")
 				fmt.Println("  set <key> <value>   - Set key to value")
 				fmt.Println("  delete <key>        - Delete key")
-				fmt.Println("  scan [prefix]       - Scan all keys or keys with prefix")
+				fmt.Println("  scan                - Scan all keys in physical order")
 				fmt.Println("  stats               - Show database statistics")
 				fmt.Println("  help                - Show this help message")
 				fmt.Println("  exit/quit           - Exit REPL")
@@ -640,14 +678,8 @@ var replCmd = &cobra.Command{
 				fmt.Println("OK")
 
 			case "scan":
-				var prefix []byte
-				if len(parts) >= 2 {
-					prefix = []byte(parts[1])
-					fmt.Printf("Scanning keys with prefix: %q\n", parts[1])
-				}
-
 				count := 0
-				err := cache.Scan(prefix, func(key []byte) bool {
+				err := cache.Scan(func(key []byte, value []byte) bool {
 					fmt.Printf("%s\n", string(key))
 					count++
 					return false // continue iteration
@@ -1021,9 +1053,6 @@ func init() {
 	verifyCmd.Flags().IntVarP(&benchKeys, "keys", "k", 1000, "Number of keys to verify (should match benchmark)")
 	verifyCmd.Flags().IntVarP(&benchKeySize, "key-size", "s", 16, "Size of each key in bytes")
 	verifyCmd.Flags().IntVarP(&benchValueSize, "value-size", "v", 128, "Size of each value in bytes")
-
-	// Add scan command flags
-	scanCmd.Flags().StringVarP(&scanPrefix, "prefix", "p", "", "Filter keys by prefix")
 
 	// Add compact command flags
 	compactCmd.Flags().BoolVar(&compactList, "list", false, "List segments by level")

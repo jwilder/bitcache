@@ -653,6 +653,13 @@ func (m *mockCache) Set(key []byte, value []byte) error {
 	return nil // No-op
 }
 
+func (m *mockCache) BatchSet(entries []struct {
+	Key   []byte
+	Value []byte
+}) error {
+	return nil // No-op
+}
+
 func (m *mockCache) Delete(key []byte) error {
 	return nil
 }
@@ -661,7 +668,7 @@ func (m *mockCache) Has(key []byte) bool {
 	return false
 }
 
-func (m *mockCache) Scan(prefix []byte, fn func(key []byte) bool) error {
+func (m *mockCache) Scan(fn func(key []byte, value []byte) bool) error {
 	return nil
 }
 

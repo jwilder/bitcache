@@ -30,6 +30,13 @@ type Cache[V any] interface {
 	// Set stores a key-value pair in the cache
 	Set(key []byte, value V) error
 
+	// BatchSet performs bulk inserts for maximum performance
+	// Use this for bulk loading operations to avoid batch timeout delays
+	BatchSet(entries []struct {
+		Key   []byte
+		Value V
+	}) error
+
 	// Delete removes a key from the cache
 	// Returns ErrKeyNotFound if the key doesn't exist
 	Delete(key []byte) error
@@ -40,9 +47,9 @@ type Cache[V any] interface {
 	// Stats returns cache statistics
 	Stats() Stats
 
-	// Scan iterates through all keys with the given prefix and calls the function for each key
+	// Scan iterates through all keys with the given prefix and calls the function for each key and value
 	// The function should return true to stop iteration, false to continue
-	Scan(prefix []byte, fn func(key []byte) bool) error
+	Scan(fn func(key []byte, value V) bool) error
 
 	// Close cleanly shuts down the cache, flushing any pending writes and releasing resources
 	// After Close is called, any subsequent operations will return ErrCacheClosed

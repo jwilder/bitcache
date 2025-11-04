@@ -2,6 +2,7 @@ package bitcache
 
 import (
 	"errors"
+	"math"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -244,6 +245,10 @@ func NewMemCache[V any](backing Cache[V], config MemCacheConfig) (*MemCache[V], 
 		config.ShardCount = defaultShardCount
 	}
 
+	if config.MaxMemoryBytes <= 0 {
+		config.MaxMemoryBytes = math.MaxInt64
+	}
+
 	mc := &MemCache[V]{
 		config:         config,
 		backing:        backing,
@@ -313,6 +318,7 @@ func (s *cacheShard[V]) tryCache(keyHash uint64, key []byte, value V) {
 
 	// Check if entry exceeds max value size limit
 	if s.memCache.config.MaxValueSize > 0 && valueSize > s.memCache.config.MaxValueSize {
+		println("skip too big")
 		return // Don't cache values that are too large
 	}
 
@@ -360,6 +366,7 @@ func (s *cacheShard[V]) tryCache(keyHash uint64, key []byte, value V) {
 
 		if !evicted {
 			// Cannot make room, don't cache this entry
+			println("no room")
 			return
 		}
 		// Retry reservation after eviction
@@ -535,6 +542,7 @@ func (mc *MemCache[V]) Get(key []byte) (V, error) {
 		return zero, err
 	}
 
+	println("cache miss")
 	// Try to cache the result if policy allows
 	shard.tryCache(keyHash, key, value)
 
@@ -557,6 +565,34 @@ func (mc *MemCache[V]) Set(key []byte, value V) error {
 
 	// Try to cache in memory if policy allows
 	shard.tryCache(keyHash, key, value)
+
+	return nil
+}
+
+// BatchSet performs bulk inserts for maximum performance
+func (mc *MemCache[V]) BatchSet(entries []struct {
+	Key   []byte
+	Value V
+}) error {
+	if mc.closed.Load() {
+		return ErrCacheClosed
+	}
+
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// Write to backing store first
+	if err := mc.backing.BatchSet(entries); err != nil {
+		return err
+	}
+
+	// Try to cache entries in memory if policy allows
+	for _, entry := range entries {
+		keyHash := hashKey(entry.Key)
+		shard := mc.getShard(keyHash)
+		shard.tryCache(keyHash, entry.Key, entry.Value)
+	}
 
 	return nil
 }
@@ -605,11 +641,19 @@ func (mc *MemCache[V]) Stats() Stats {
 }
 
 // Scan iterates through all keys in the backing cache
-func (mc *MemCache[V]) Scan(prefix []byte, fn func(key []byte) bool) error {
+func (mc *MemCache[V]) Scan(fn func(key []byte, value V) bool) error {
 	if mc.closed.Load() {
 		return ErrCacheClosed
 	}
-	return mc.backing.Scan(prefix, fn)
+	return mc.backing.Scan(func(key []byte, value V) bool {
+		keyHash := hashKey(key)
+		shard := mc.getShard(keyHash)
+
+		// Try to cache in memory if policy allows
+		shard.tryCache(keyHash, key, value)
+
+		return fn(key, value)
+	})
 }
 
 // MemStats returns memory-specific statistics

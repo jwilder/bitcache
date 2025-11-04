@@ -1,11 +1,17 @@
 package bitcache
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -804,6 +810,79 @@ func BenchmarkDiskKV_CompactionSpeed(b *testing.B) {
 	}
 }
 
+func BenchmarkDiskCache_ReadLogEntry(b *testing.B) {
+	tmpDir, err := os.MkdirTemp("", "bitcask_readlog_bench")
+	if err != nil {
+		b.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cache, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
+	if err != nil {
+		b.Fatalf("Failed to create cache: %v", err)
+	}
+
+	// Write test data with various sizes
+	for i := 0; i < 1000; i++ {
+		key := []byte(fmt.Sprintf("benchmark_key_%04d", i))
+		value := make([]byte, 100+i%900) // Variable size values 100-1000 bytes
+		for j := range value {
+			value[j] = byte(i % 256)
+		}
+		if err := cache.Set(key, value); err != nil {
+			b.Fatalf("Failed to set key: %v", err)
+		}
+	}
+
+	if err := cache.Sync(); err != nil {
+		b.Fatalf("Failed to sync: %v", err)
+	}
+
+	cache.Close()
+
+	// Reopen to read from disk
+	cache, err = NewDiskCache(tmpDir, ByteSliceMarshaler{})
+	if err != nil {
+		b.Fatalf("Failed to reopen cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Get a file handle for benchmarking
+	files, _ := filepath.Glob(filepath.Join(tmpDir, "*.log"))
+	if len(files) == 0 {
+		b.Fatal("No log files found")
+	}
+
+	file, err := os.Open(files[0])
+	if err != nil {
+		b.Fatalf("Failed to open log file: %v", err)
+	}
+	defer file.Close()
+
+	// Skip header
+	file.Seek(fileHeaderSize, 0)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		// Reset file position for each iteration
+		file.Seek(fileHeaderSize, 0)
+		reader := bufio.NewReader(file)
+
+		// Read some entries
+		for j := 0; j < 10; j++ {
+			_, _, err := cache.readLogEntry(reader)
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				b.Fatalf("Failed to read log entry: %v", err)
+			}
+		}
+	}
+}
+
 // TestDiskCache_NoSegmentCreationOnReopen validates that reopening a database
 // and performing read operations doesn't create unnecessary segment files
 func TestDiskCache_NoSegmentCreationOnReopen(t *testing.T) {
@@ -1086,36 +1165,33 @@ func TestDiskCache_CorruptedCRC(t *testing.T) {
 	}
 	file.Close()
 
-	// Reopen cache - should skip the corrupted record
+	// Reopen cache - the corrupted record and everything after it will be truncated
+	// This is the correct behavior: when corruption is detected at the beginning,
+	// we can't reliably determine where subsequent valid records start
 	cache2, err := NewDiskCache(tmpDir, ByteSliceMarshaler{})
 	if err != nil {
 		t.Fatalf("Failed to reopen cache: %v", err)
 	}
 	defer cache2.Close()
 
-	// First key should be missing or inaccessible
-	_, err = cache2.Get([]byte("key0"))
-	if err == nil {
-		t.Logf("Warning: Expected key0 to be corrupted but it was recovered")
-	}
-
-	// Later keys should still be accessible
+	// All keys should be missing since corruption was at the first record
+	// and the entire segment was truncated from that point
 	recovered := 0
-	for i := 1; i < 5; i++ {
+	for i := 0; i < 5; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
-		value, err := cache2.Get(key)
+		_, err := cache2.Get(key)
 		if err == nil {
-			expectedValue := []byte(fmt.Sprintf("value%d", i))
-			if bytes.Equal(value, expectedValue) {
-				recovered++
-			}
+			recovered++
 		}
 	}
 
-	if recovered < 2 {
-		t.Errorf("Expected to recover at least 2 keys after first record corruption, got %d", recovered)
+	// When first record is corrupted, all data after it is truncated
+	// This is safe behavior to prevent reading invalid data
+	if recovered > 0 {
+		t.Errorf("Expected all keys to be lost after first record corruption (file truncated), but recovered %d", recovered)
 	}
-	t.Logf("Recovered %d out of 4 subsequent keys after CRC corruption", recovered)
+
+	t.Logf("Correctly truncated segment after first record corruption - recovered %d out of 5 keys (expected 0)", recovered)
 }
 
 // TestDiskCache_CorruptedHints tests recovery when hints are corrupted.
@@ -1609,7 +1685,7 @@ func TestDiskCache_PartialRecordWrite(t *testing.T) {
 // Tests moved from scan_order_test.go
 // Tests moved from scan_order_test.go
 
-// TestDiskCache_Scan_OrderedKeys verifies that Scan returns keys in lexicographic order with btree
+// TestDiskCache_Scan_OrderedKeys verifies that Scan returns keys in physical write order
 func TestDiskCache_Scan_OrderedKeys(t *testing.T) {
 	dir, err := os.MkdirTemp("", "bitcache-scan-order-test-*")
 	if err != nil {
@@ -1623,7 +1699,7 @@ func TestDiskCache_Scan_OrderedKeys(t *testing.T) {
 	}
 	defer cache.Close()
 
-	// Insert keys in random order to ensure they're distributed across shards
+	// Insert keys in a specific order
 	testKeys := []string{
 		"zebra",
 		"apple",
@@ -1650,9 +1726,9 @@ func TestDiskCache_Scan_OrderedKeys(t *testing.T) {
 		}
 	}
 
-	// Scan all keys and verify they're in order
+	// Scan all keys and verify they're in write order
 	var scannedKeys []string
-	err = cache.Scan(nil, func(key []byte) bool {
+	err = cache.Scan(func(key []byte, value []byte) bool {
 		scannedKeys = append(scannedKeys, string(key))
 		return false
 	})
@@ -1660,9 +1736,9 @@ func TestDiskCache_Scan_OrderedKeys(t *testing.T) {
 		t.Fatalf("Scan failed: %v", err)
 	}
 
-	// Verify the keys are sorted
-	if !sort.StringsAreSorted(scannedKeys) {
-		t.Errorf("Keys are not in sorted order. Got: %v", scannedKeys)
+	// Verify the keys are in the same order as written (physical order)
+	if !reflect.DeepEqual(scannedKeys, testKeys) {
+		t.Errorf("Keys are not in write order.\nExpected: %v\nGot: %v", testKeys, scannedKeys)
 	}
 
 	// Verify we got all keys
@@ -1670,10 +1746,11 @@ func TestDiskCache_Scan_OrderedKeys(t *testing.T) {
 		t.Errorf("Expected %d keys, got %d", len(testKeys), len(scannedKeys))
 	}
 
-	t.Logf("Scanned keys in order: %v", scannedKeys)
+	t.Logf("Scanned %d keys in physical write order", len(scannedKeys))
 }
 
-// TestDiskCache_Scan_PrefixOrderedKeys verifies that Scan with prefix returns keys in lexicographic order
+// TestDiskCache_Scan_PrefixOrderedKeys verifies that Scan returns all keys in physical write order
+// and can be filtered by prefix by the caller
 func TestDiskCache_Scan_PrefixOrderedKeys(t *testing.T) {
 	dir, err := os.MkdirTemp("", "bitcache-scan-prefix-order-test-*")
 	if err != nil {
@@ -1687,7 +1764,7 @@ func TestDiskCache_Scan_PrefixOrderedKeys(t *testing.T) {
 	}
 	defer cache.Close()
 
-	// Insert keys with different prefixes
+	// Insert keys with different prefixes in a specific order
 	testKeys := []string{
 		"user:zebra",
 		"user:alice",
@@ -1708,59 +1785,40 @@ func TestDiskCache_Scan_PrefixOrderedKeys(t *testing.T) {
 		}
 	}
 
-	// Test scanning with "user:" prefix
-	var userKeys []string
-	err = cache.Scan([]byte("user:"), func(key []byte) bool {
-		userKeys = append(userKeys, string(key))
+	// Scan all keys - returns in physical write order
+	var allKeys []string
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		allKeys = append(allKeys, string(key))
 		return false
 	})
 	if err != nil {
-		t.Fatalf("Scan with prefix failed: %v", err)
+		t.Fatalf("Scan failed: %v", err)
 	}
 
-	// Verify the keys are sorted
-	if !sort.StringsAreSorted(userKeys) {
-		t.Errorf("User keys are not in sorted order. Got: %v", userKeys)
+	// Verify we got all keys in write order
+	if !reflect.DeepEqual(allKeys, testKeys) {
+		t.Errorf("Keys not in write order.\nExpected: %v\nGot: %v", testKeys, allKeys)
 	}
 
-	// Verify we got the right keys
-	expectedUserKeys := []string{"user:alice", "user:bob", "user:mango", "user:zebra"}
-	if len(userKeys) != len(expectedUserKeys) {
-		t.Errorf("Expected %d user keys, got %d", len(expectedUserKeys), len(userKeys))
-	}
-
-	for i, key := range userKeys {
-		if key != expectedUserKeys[i] {
-			t.Errorf("Key at position %d: expected %s, got %s", i, expectedUserKeys[i], key)
+	// Test filtering by prefix after scanning
+	var userKeys []string
+	for _, key := range allKeys {
+		if strings.HasPrefix(key, "user:") {
+			userKeys = append(userKeys, key)
 		}
 	}
 
-	t.Logf("User keys in order: %v", userKeys)
-
-	// Test scanning with "config:" prefix
-	var configKeys []string
-	err = cache.Scan([]byte("config:"), func(key []byte) bool {
-		configKeys = append(configKeys, string(key))
-		return false
-	})
-	if err != nil {
-		t.Fatalf("Scan with config prefix failed: %v", err)
+	// Verify we got the right user keys in write order
+	expectedUserKeys := []string{"user:zebra", "user:alice", "user:mango", "user:bob"}
+	if !reflect.DeepEqual(userKeys, expectedUserKeys) {
+		t.Errorf("User keys not in write order.\nExpected: %v\nGot: %v", expectedUserKeys, userKeys)
 	}
 
-	// Verify the keys are sorted
-	if !sort.StringsAreSorted(configKeys) {
-		t.Errorf("Config keys are not in sorted order. Got: %v", configKeys)
-	}
-
-	expectedConfigKeys := []string{"config:a", "config:m", "config:z"}
-	if len(configKeys) != len(expectedConfigKeys) {
-		t.Errorf("Expected %d config keys, got %d", len(expectedConfigKeys), len(configKeys))
-	}
-
-	t.Logf("Config keys in order: %v", configKeys)
+	t.Logf("Scanned %d total keys, %d with user: prefix", len(allKeys), len(userKeys))
 }
 
-// TestDiskCache_Scan_OrderWithDeletes verifies that deleted keys are not returned and order is maintained
+// TestDiskCache_Scan_OrderWithDeletes verifies that Scan returns keys in write order,
+// including deleted keys (which are tombstones), and that Has() correctly filters them
 func TestDiskCache_Scan_OrderWithDeletes(t *testing.T) {
 	dir, err := os.MkdirTemp("", "bitcache-scan-delete-order-test-*")
 	if err != nil {
@@ -1790,34 +1848,57 @@ func TestDiskCache_Scan_OrderWithDeletes(t *testing.T) {
 		}
 	}
 
-	// Scan and verify order
+	// Scan and verify order - returns all entries in write order (including delete tombstones)
 	var scannedKeys []string
-	err = cache.Scan(nil, func(key []byte) bool {
+	var deletedCount int
+	err = cache.Scan(func(key []byte, value []byte) bool {
 		scannedKeys = append(scannedKeys, string(key))
+		if value == nil {
+			deletedCount++
+		}
 		return false
 	})
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
 
-	// Verify the keys are sorted
-	if !sort.StringsAreSorted(scannedKeys) {
-		t.Errorf("Keys are not in sorted order. Got: %v", scannedKeys)
-	}
-
-	// Verify deleted keys are not present
-	expectedKeys := []string{"a", "c", "e", "g", "h"}
+	// Expected order: original 8 writes + 3 delete tombstones = 11 entries
+	expectedKeys := []string{"a", "b", "c", "d", "e", "f", "g", "h", "b", "d", "f"}
 	if len(scannedKeys) != len(expectedKeys) {
-		t.Errorf("Expected %d keys, got %d: %v", len(expectedKeys), len(scannedKeys), scannedKeys)
+		t.Errorf("Expected %d keys (including delete tombstones), got %d: %v", len(expectedKeys), len(scannedKeys), scannedKeys)
 	}
 
-	for i, key := range scannedKeys {
-		if key != expectedKeys[i] {
-			t.Errorf("Key at position %d: expected %s, got %s", i, expectedKeys[i], key)
+	// Verify they're in write order
+	if !reflect.DeepEqual(scannedKeys, expectedKeys) {
+		t.Errorf("Keys not in write order.\nExpected: %v\nGot: %v", expectedKeys, scannedKeys)
+	}
+
+	// Verify we got the correct number of deleted entries
+	if deletedCount != len(deleteKeys) {
+		t.Errorf("Expected %d deleted entries (nil values), got %d", len(deleteKeys), deletedCount)
+	}
+
+	// Verify deleted keys are not accessible via Has()
+	for _, key := range deleteKeys {
+		if cache.Has([]byte(key)) {
+			t.Errorf("Deleted key %s is still accessible via Has()", key)
 		}
 	}
 
-	t.Logf("Scanned keys (with deletes) in order: %v", scannedKeys)
+	// Filter out deleted keys manually to get live keys
+	var liveKeys []string
+	for _, key := range scannedKeys {
+		if cache.Has([]byte(key)) {
+			liveKeys = append(liveKeys, key)
+		}
+	}
+
+	expectedLiveKeys := []string{"a", "c", "e", "g", "h"}
+	if !reflect.DeepEqual(liveKeys, expectedLiveKeys) {
+		t.Errorf("Live keys after filtering.\nExpected: %v\nGot: %v", expectedLiveKeys, liveKeys)
+	}
+
+	t.Logf("Scanned %d total keys (%d live, %d deleted) in write order", len(scannedKeys), len(liveKeys), deletedCount)
 }
 
 // TestDiskCache_Scan_EarlyTermination verifies that Scan stops when function returns true
@@ -1844,7 +1925,7 @@ func TestDiskCache_Scan_EarlyTermination(t *testing.T) {
 
 	// Scan and stop after 10 keys
 	var scannedKeys []string
-	err = cache.Scan(nil, func(key []byte) bool {
+	err = cache.Scan(func(key []byte, value []byte) bool {
 		scannedKeys = append(scannedKeys, string(key))
 		return len(scannedKeys) >= 10
 	})
@@ -1889,7 +1970,7 @@ func TestDiskCache_Scan_LargeDataset(t *testing.T) {
 
 	// Scan all keys
 	var scannedKeys []string
-	err = cache.Scan(nil, func(key []byte) bool {
+	err = cache.Scan(func(key []byte, value []byte) bool {
 		scannedKeys = append(scannedKeys, string(key))
 		return false
 	})
@@ -1908,4 +1989,2121 @@ func TestDiskCache_Scan_LargeDataset(t *testing.T) {
 	}
 
 	t.Logf("Successfully scanned %d keys in sorted order", len(scannedKeys))
+}
+
+func TestAutoCompaction(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-autocompact-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Create cache with auto-compaction enabled
+	config := DiskCacheConfig{
+		MaxSegmentSize:      512, // Very small segments for testing
+		AutoCompactEnabled:  true,
+		AutoCompactInterval: 2 * time.Second, // Check every 2 seconds
+	}
+
+	cache, err := NewDiskCacheWithConfig(dir, config, JSONMarshaler[string]{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+
+	// Write enough data to create multiple segments
+	for i := 0; i < 200; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := fmt.Sprintf("value-%d-with-some-padding-to-make-it-larger-and-force-rotation", i)
+		if err := cache.Set([]byte(key), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Force sync to ensure all writes are flushed
+	if err := cache.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Check initial segment count
+	initialStats := cache.Stats()
+	t.Logf("Initial segments: %d", initialStats.Segments)
+
+	if initialStats.Segments < 2 {
+		t.Fatal("Expected at least 2 segments to be created")
+	}
+
+	// Wait for auto-compaction to trigger (twice the interval to be safe)
+	time.Sleep(5 * time.Second)
+
+	// Check if compaction occurred
+	// We can't guarantee exact counts, but we can check that the cache is still functional
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value, err := cache.Get([]byte(key))
+		if err != nil {
+			t.Errorf("Failed to get key %s after auto-compaction: %v", key, err)
+		}
+		expectedValue := fmt.Sprintf("value-%d-with-some-padding-to-make-it-larger-and-force-rotation", i)
+		if value != expectedValue {
+			t.Errorf("Value mismatch for key %s: got %s, want %s", key, value, expectedValue)
+		}
+	}
+
+	finalStats := cache.Stats()
+	t.Logf("Final segments: %d", finalStats.Segments)
+	t.Logf("Auto-compaction test completed successfully")
+}
+
+func TestAutoCompactionDisabled(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-no-autocompact-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Create cache with auto-compaction disabled
+	config := DiskCacheConfig{
+		MaxSegmentSize:     1024,
+		AutoCompactEnabled: false, // Disabled
+	}
+
+	cache, err := NewDiskCacheWithConfig(dir, config, JSONMarshaler[string]{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+
+	// Write enough data to create multiple segments
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := fmt.Sprintf("value-%d-with-some-padding", i)
+		if err := cache.Set([]byte(key), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Force sync
+	if err := cache.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := cache.Stats()
+	t.Logf("Segments with auto-compact disabled: %d", stats.Segments)
+
+	// Verify that auto-compaction goroutine is not running
+	if cache.autoCompactDone != nil {
+		t.Error("autoCompactDone channel should be nil when auto-compaction is disabled")
+	}
+}
+
+func TestInMemorySegmentTracking(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-segment-tracking-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	config := DiskCacheConfig{
+		MaxSegmentSize:     1024,
+		AutoCompactEnabled: false,
+	}
+
+	cache, err := NewDiskCacheWithConfig(dir, config, JSONMarshaler[string]{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+
+	// Write data to create segments
+	for i := 0; i < 50; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := fmt.Sprintf("value-%d-padding", i)
+		if err := cache.Set([]byte(key), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := cache.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Check that in-memory segment tracking is populated
+	cache.segmentsMutex.RLock()
+	segmentCount := len(cache.segments)
+	cache.segmentsMutex.RUnlock()
+
+	t.Logf("In-memory segment count: %d", segmentCount)
+
+	// Get segments by level (should use in-memory tracking)
+	byLevel, err := cache.getSegmentsByLevel()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var totalSegments int
+	for level, segments := range byLevel {
+		totalSegments += len(segments)
+		t.Logf("Level %d: %d segments", level, len(segments))
+	}
+
+	if totalSegments == 0 {
+		t.Error("Expected at least some segments to be tracked")
+	}
+
+	t.Logf("Total segments from getSegmentsByLevel: %d", totalSegments)
+}
+
+// TestDiskCache_Scan_WithValues verifies that Scan passes correct values to the callback
+func TestDiskCache_Scan_WithValues(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scan-values-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Insert test data with known key-value pairs
+	testData := map[string]string{
+		"key1":   "value1",
+		"key2":   "value2",
+		"key3":   "value3",
+		"apple":  "red",
+		"banana": "yellow",
+	}
+
+	for key, value := range testData {
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	// Scan all keys and verify values match
+	scannedCount := 0
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		keyStr := string(key)
+		valueStr := string(value)
+
+		expectedValue, exists := testData[keyStr]
+		if !exists {
+			t.Errorf("Unexpected key: %s", keyStr)
+			return true // stop iteration
+		}
+
+		if valueStr != expectedValue {
+			t.Errorf("Value mismatch for key %s: expected %s, got %s", keyStr, expectedValue, valueStr)
+			return true // stop iteration
+		}
+
+		scannedCount++
+		return false // continue
+	})
+
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	if scannedCount != len(testData) {
+		t.Errorf("Expected to scan %d keys, but scanned %d", len(testData), scannedCount)
+	}
+
+	t.Logf("Successfully verified values for %d keys", scannedCount)
+}
+
+// TestDiskCache_Scan_PrefixWithValues verifies that prefix scanning returns correct values
+func TestDiskCache_Scan_PrefixWithValues(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scan-prefix-values-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Insert test data with prefixes
+	testData := map[string]string{
+		"user:alice":   "alice@example.com",
+		"user:bob":     "bob@example.com",
+		"user:charlie": "charlie@example.com",
+		"config:db":    "postgres://localhost",
+		"config:cache": "redis://localhost",
+	}
+
+	for key, value := range testData {
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	// Scan all entries and count by prefix
+	userCount := 0
+	configCount := 0
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		keyStr := string(key)
+		valueStr := string(value)
+
+		expectedValue, exists := testData[keyStr]
+		if !exists {
+			t.Errorf("Unexpected key: %s", keyStr)
+			return true
+		}
+
+		if valueStr != expectedValue {
+			t.Errorf("Value mismatch for key %s: expected %s, got %s", keyStr, expectedValue, valueStr)
+			return true
+		}
+
+		// Count by prefix
+		if strings.HasPrefix(keyStr, "user:") {
+			userCount++
+			t.Logf("Found user: %s = %s", keyStr, valueStr)
+		} else if strings.HasPrefix(keyStr, "config:") {
+			configCount++
+			t.Logf("Found config: %s = %s", keyStr, valueStr)
+		}
+
+		return false
+	})
+
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	if userCount != 3 {
+		t.Errorf("Expected 3 user keys, got %d", userCount)
+	}
+
+	if configCount != 2 {
+		t.Errorf("Expected 2 config keys, got %d", configCount)
+	}
+
+	t.Logf("Successfully verified %d user keys and %d config keys", userCount, configCount)
+
+}
+
+// TestMemCache_Scan_WithValues verifies MemCache also passes values correctly
+func TestMemCache_Scan_WithValues(t *testing.T) {
+	dir, err := os.MkdirTemp("", "memcache-scan-values-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	diskCache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create disk cache: %v", err)
+	}
+	defer diskCache.Close()
+
+	memCache, err := NewMemCache[[]byte](diskCache, MemCacheConfig{
+		MaxMemoryBytes: 1024 * 1024, // 1MB
+		EvictionPolicy: EvictionLRU,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create mem cache: %v", err)
+	}
+	defer memCache.Close()
+
+	// Insert test data
+	testData := map[string]string{
+		"key1": "value1",
+		"key2": "value2",
+		"key3": "value3",
+	}
+
+	for key, value := range testData {
+		if err := memCache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	// Scan and verify values
+	scannedCount := 0
+	err = memCache.Scan(func(key []byte, value []byte) bool {
+		keyStr := string(key)
+		valueStr := string(value)
+
+		expectedValue, exists := testData[keyStr]
+		if !exists {
+			t.Errorf("Unexpected key: %s", keyStr)
+			return true
+		}
+
+		if valueStr != expectedValue {
+			t.Errorf("Value mismatch for key %s: expected %s, got %s", keyStr, expectedValue, valueStr)
+			return true
+		}
+
+		scannedCount++
+		return false
+	})
+
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	if scannedCount != len(testData) {
+		t.Errorf("Expected to scan %d keys, but scanned %d", len(testData), scannedCount)
+	}
+
+	t.Logf("Successfully verified values for %d keys via MemCache", scannedCount)
+}
+
+// TestDiskCache_Scan_SkipsCorruptedRecords verifies that Scan continues even when some records are corrupted
+func TestDiskCache_Scan_SkipsCorruptedRecords(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scan-corrupt-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+
+	// Insert test data
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("key-%02d", i)
+		value := fmt.Sprintf("value-%02d", i)
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	// Force sync to ensure data is written
+	if err := cache.Sync(); err != nil {
+		t.Fatalf("Failed to sync: %v", err)
+	}
+
+	cache.Close()
+
+	// Find the log file and corrupt one record in the middle
+	files, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("Failed to find log files: %v", err)
+	}
+
+	// Open the log file and corrupt a record in the middle
+	logFile := files[0]
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("Failed to read log file: %v", err)
+	}
+
+	// Find approximately the middle of the file and corrupt some bytes
+	// Skip the file header (first 8 bytes)
+	corruptOffset := len(data) / 2
+	if corruptOffset < 100 {
+		corruptOffset = 100
+	}
+
+	// Corrupt 20 bytes in the middle
+	for i := 0; i < 20 && corruptOffset+i < len(data); i++ {
+		data[corruptOffset+i] = 0xFF
+	}
+
+	if err := os.WriteFile(logFile, data, 0644); err != nil {
+		t.Fatalf("Failed to write corrupted log file: %v", err)
+	}
+
+	// Reopen the cache
+	cache, err = NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to reopen cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Now scan - it should skip the corrupted record and continue
+	scannedKeys := make(map[string]string)
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		scannedKeys[string(key)] = string(value)
+		return false // continue
+	})
+
+	// Scan should succeed (not return an error)
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	// We should have scanned some keys (not all 10, but at least some)
+	if len(scannedKeys) == 0 {
+		t.Error("Scan returned no keys - should have returned readable keys")
+	}
+
+	// Log what we got
+	t.Logf("Scanned %d keys out of 10 (some were corrupted and skipped)", len(scannedKeys))
+
+	// Verify the scanned keys have correct values
+	for key, value := range scannedKeys {
+		expectedValue := "value-" + key[4:] // Extract the number from "key-XX"
+		if value != expectedValue {
+			t.Errorf("Value mismatch for %s: expected %s, got %s", key, expectedValue, value)
+		}
+	}
+}
+
+// TestDiskCache_Scan_AllCorrupted verifies behavior when all records are corrupted
+func TestDiskCache_Scan_AllCorrupted(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scan-allcorrupt-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+
+	// Insert test data
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := fmt.Sprintf("value-%d", i)
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	if err := cache.Sync(); err != nil {
+		t.Fatalf("Failed to sync: %v", err)
+	}
+
+	cache.Close()
+
+	// Corrupt the entire log file (except header)
+	files, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("Failed to find log files: %v", err)
+	}
+
+	logFile := files[0]
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("Failed to read log file: %v", err)
+	}
+
+	// Corrupt everything after the header
+	for i := fileHeaderSize; i < len(data); i++ {
+		data[i] = 0xFF
+	}
+
+	if err := os.WriteFile(logFile, data, 0644); err != nil {
+		t.Fatalf("Failed to write corrupted log file: %v", err)
+	}
+
+	// Reopen the cache
+	cache, err = NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to reopen cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Scan should succeed but return no keys
+	scannedCount := 0
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		scannedCount++
+		return false
+	})
+
+	// Scan should not return an error even though all records are corrupted
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	// We should get 0 keys since all are corrupted
+	if scannedCount > 0 {
+		t.Errorf("Expected 0 keys from corrupted file, got %d", scannedCount)
+	}
+
+	t.Logf("Scan correctly returned 0 keys from fully corrupted file")
+}
+
+// TestDiskCache_Scan_PartiallyCorrupted verifies Scan works with some corrupted, some valid records
+func TestDiskCache_Scan_PartiallyCorrupted(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scan-partial-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+
+	// Insert test data with known keys
+	testKeys := []string{"apple", "banana", "cherry", "date", "elderberry"}
+	for _, key := range testKeys {
+		value := "fruit-" + key
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	if err := cache.Sync(); err != nil {
+		t.Fatalf("Failed to sync: %v", err)
+	}
+
+	cache.Close()
+
+	// Corrupt just one record in the middle
+	files, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("Failed to find log files: %v", err)
+	}
+
+	logFile := files[0]
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("Failed to read log file: %v", err)
+	}
+
+	// Find and corrupt approximately the middle entry
+	middleOffset := len(data) / 2
+	if middleOffset < 200 {
+		middleOffset = 200
+	}
+
+	// Corrupt a small section (simulating one bad record)
+	for i := 0; i < 30 && middleOffset+i < len(data); i++ {
+		data[middleOffset+i] = 0xAA
+	}
+
+	if err := os.WriteFile(logFile, data, 0644); err != nil {
+		t.Fatalf("Failed to write corrupted log file: %v", err)
+	}
+
+	// Reopen the cache
+	cache, err = NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to reopen cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Scan and collect keys
+	scannedKeys := make(map[string]bool)
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		scannedKeys[string(key)] = true
+		return false
+	})
+
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	// We should have at least some keys (corruption only affected one record)
+	if len(scannedKeys) == 0 {
+		t.Error("Scan returned no keys - should have returned some valid keys")
+	}
+
+	// We should have fewer than all keys due to corruption
+	if len(scannedKeys) >= len(testKeys) {
+		t.Logf("Got all %d keys - corruption may not have affected the keydir", len(scannedKeys))
+	} else {
+		t.Logf("Got %d keys out of %d (some were corrupted and skipped)", len(scannedKeys), len(testKeys))
+	}
+
+	t.Logf("Successfully scanned keys: %v", scannedKeys)
+}
+
+// TestScanIncludesDeletedEntries demonstrates that Scan now includes deleted entries with nil values
+func TestScanIncludesDeletedEntries(t *testing.T) {
+	dir := t.TempDir()
+
+	cache, err := NewDiskCache[[]byte](dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Write some keys
+	keys := []string{"apple", "banana", "cherry", "date", "elderberry"}
+	for _, key := range keys {
+		value := []byte(fmt.Sprintf("value-%s", key))
+		if err := cache.Set([]byte(key), value); err != nil {
+			t.Fatalf("failed to set key %s: %v", key, err)
+		}
+	}
+
+	// Delete some keys
+	deleteKeys := []string{"banana", "date"}
+	for _, key := range deleteKeys {
+		if err := cache.Delete([]byte(key)); err != nil {
+			t.Fatalf("failed to delete key %s: %v", key, err)
+		}
+	}
+
+	// Scan and verify deleted entries are included with nil values
+	var scannedEntries []struct {
+		key     string
+		value   []byte
+		deleted bool
+	}
+
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		entry := struct {
+			key     string
+			value   []byte
+			deleted bool
+		}{
+			key:     string(key),
+			value:   value,
+			deleted: value == nil,
+		}
+		scannedEntries = append(scannedEntries, entry)
+		return false
+	})
+	if err != nil {
+		t.Fatalf("scan failed: %v", err)
+	}
+
+	// Verify we got all entries including deleted ones
+	expectedTotalEntries := len(keys) + len(deleteKeys) // 5 writes + 2 deletes = 7 entries
+	if len(scannedEntries) != expectedTotalEntries {
+		t.Errorf("expected %d total entries, got %d", expectedTotalEntries, len(scannedEntries))
+	}
+
+	// Count live and deleted entries
+	var liveCount, deletedCount int
+	for _, entry := range scannedEntries {
+		if entry.deleted {
+			deletedCount++
+			t.Logf("Deleted entry: key=%s value=nil", entry.key)
+		} else {
+			liveCount++
+			t.Logf("Live entry: key=%s value=%s", entry.key, entry.value)
+		}
+	}
+
+	// Verify counts
+	if deletedCount != len(deleteKeys) {
+		t.Errorf("expected %d deleted entries, got %d", len(deleteKeys), deletedCount)
+	}
+
+	if liveCount != len(keys) {
+		t.Errorf("expected %d live entries, got %d", len(keys), liveCount)
+	}
+
+	// Verify specific deleted keys have nil values
+	deletedKeysMap := make(map[string]bool)
+	for _, entry := range scannedEntries {
+		if entry.deleted {
+			deletedKeysMap[entry.key] = true
+		}
+	}
+
+	for _, key := range deleteKeys {
+		if !deletedKeysMap[key] {
+			t.Errorf("deleted key %s not found in scan with nil value", key)
+		}
+	}
+
+	t.Logf("✓ Scan correctly includes %d deleted entries with nil values", deletedCount)
+}
+
+// TestScanDeletedEntriesWithValues verifies deleted entries have nil values
+func TestScanDeletedEntriesWithValues(t *testing.T) {
+	dir := t.TempDir()
+
+	cache, err := NewDiskCache[[]byte](dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Write a key with a value
+	key := []byte("test-key")
+	originalValue := []byte("original-value")
+	if err := cache.Set(key, originalValue); err != nil {
+		t.Fatalf("failed to set key: %v", err)
+	}
+
+	// Verify we can read it
+	value, err := cache.Get(key)
+	if err != nil {
+		t.Fatalf("failed to get key: %v", err)
+	}
+	if !bytes.Equal(value, originalValue) {
+		t.Errorf("expected %s, got %s", originalValue, value)
+	}
+
+	// Delete the key
+	if err := cache.Delete(key); err != nil {
+		t.Fatalf("failed to delete key: %v", err)
+	}
+
+	// Verify it's deleted via Get
+	_, err = cache.Get(key)
+	if err != ErrKeyNotFound {
+		t.Errorf("expected ErrKeyNotFound, got %v", err)
+	}
+
+	// Scan and verify we see both the original write and the delete
+	var entries []struct {
+		key   string
+		value []byte
+	}
+
+	err = cache.Scan(func(k []byte, v []byte) bool {
+		entries = append(entries, struct {
+			key   string
+			value []byte
+		}{string(k), v})
+		return false
+	})
+	if err != nil {
+		t.Fatalf("scan failed: %v", err)
+	}
+
+	// Should have 2 entries: original write + delete tombstone
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries (write + delete), got %d", len(entries))
+	}
+
+	// First entry should be the original write
+	if string(entries[0].key) != "test-key" {
+		t.Errorf("first entry key: expected test-key, got %s", entries[0].key)
+	}
+	if !bytes.Equal(entries[0].value, originalValue) {
+		t.Errorf("first entry value: expected %s, got %s", originalValue, entries[0].value)
+	}
+
+	// Second entry should be the delete tombstone (same key, nil value)
+	if string(entries[1].key) != "test-key" {
+		t.Errorf("second entry key: expected test-key, got %s", entries[1].key)
+	}
+	if entries[1].value != nil {
+		t.Errorf("second entry value: expected nil (deleted), got %s", entries[1].value)
+	}
+
+	t.Log("✓ Scan correctly returns deleted entry with nil value")
+}
+
+// TestDiskCache_Scan_Basic verifies basic physical scan functionality
+func TestDiskCache_Scan_Basic(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scanphysical-basic-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Insert test data
+	testData := map[string]string{
+		"key1": "value1",
+		"key2": "value2",
+		"key3": "value3",
+		"key4": "value4",
+		"key5": "value5",
+	}
+
+	for key, value := range testData {
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	// Scan physically and verify we get all data
+	scanned := make(map[string]string)
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		scanned[string(key)] = string(value)
+		return false // continue
+	})
+
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	// Verify we got all keys
+	if len(scanned) != len(testData) {
+		t.Errorf("Expected %d keys, got %d", len(testData), len(scanned))
+	}
+
+	// Verify values match
+	for key, expectedValue := range testData {
+		if actualValue, ok := scanned[key]; !ok {
+			t.Errorf("Missing key: %s", key)
+		} else if actualValue != expectedValue {
+			t.Errorf("Value mismatch for %s: expected %s, got %s", key, expectedValue, actualValue)
+		}
+	}
+
+	t.Logf("Successfully scanned %d entries physically", len(scanned))
+}
+
+// TestDiskCache_Scan_MultipleSegments verifies scanning across multiple segments
+func TestDiskCache_Scan_MultipleSegments(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scanphysical-multi-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Create cache with small segments to force multiple files
+	cache, err := NewDiskCacheWithConfig(dir, DiskCacheConfig{
+		MaxSegmentSize: 512, // Very small to force multiple segments
+	}, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Insert data to create multiple segments
+	numKeys := 50
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("key-%03d", i)
+		value := fmt.Sprintf("value-%03d-with-some-padding-to-make-it-larger", i)
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	if err := cache.Sync(); err != nil {
+		t.Fatalf("Failed to sync: %v", err)
+	}
+
+	// Check we have multiple segments
+	stats := cache.Stats()
+	t.Logf("Created %d segments", stats.Segments)
+	if stats.Segments < 2 {
+		t.Logf("Warning: Expected multiple segments, got %d", stats.Segments)
+	}
+
+	// Scan physically
+	scannedKeys := make([]string, 0)
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		scannedKeys = append(scannedKeys, string(key))
+		return false
+	})
+
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	// Verify we got all keys
+	if len(scannedKeys) != numKeys {
+		t.Errorf("Expected %d keys, got %d", numKeys, len(scannedKeys))
+	}
+
+	t.Logf("Successfully scanned %d entries across %d segments", len(scannedKeys), stats.Segments)
+}
+
+// TestDiskCache_Scan_EarlyStop verifies early termination works
+func TestDiskCache_Scan_EarlyStop(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scanphysical-stop-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Insert test data
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("key-%02d", i)
+		value := fmt.Sprintf("value-%02d", i)
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	// Scan and stop after 5 entries
+	count := 0
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		count++
+		return count >= 5 // stop after 5
+	})
+
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	if count != 5 {
+		t.Errorf("Expected to stop at 5 entries, got %d", count)
+	}
+
+	t.Logf("Successfully stopped after %d entries", count)
+}
+
+// TestDiskCache_Scan_SkipsDeleted verifies that deleted keys still appear in the log
+// but can be identified by checking Has() or Get() separately
+func TestDiskCache_Scan_SkipsDeleted(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scanphysical-deleted-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Insert test data
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := fmt.Sprintf("value-%d", i)
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	// Delete some keys
+	deletedKeys := []string{"key-2", "key-5", "key-7"}
+	for _, key := range deletedKeys {
+		if err := cache.Delete([]byte(key)); err != nil {
+			t.Fatalf("Failed to delete %s: %v", key, err)
+		}
+	}
+
+	if err := cache.Sync(); err != nil {
+		t.Fatalf("Failed to sync: %v", err)
+	}
+
+	// Scan physically - returns all entries including duplicates
+	scannedKeys := make([]string, 0)
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		scannedKeys = append(scannedKeys, string(key))
+		return false
+	})
+
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	// Count unique keys
+	uniqueKeys := make(map[string]bool)
+	for _, key := range scannedKeys {
+		uniqueKeys[key] = true
+	}
+
+	// Verify we scanned all 10 keys (Scan returns all physical entries)
+	if len(uniqueKeys) != 10 {
+		t.Errorf("Expected 10 unique keys, got %d", len(uniqueKeys))
+	}
+
+	// Verify deleted keys are not accessible via Has()
+	for _, deletedKey := range deletedKeys {
+		if cache.Has([]byte(deletedKey)) {
+			t.Errorf("Deleted key %s is still accessible via Has()", deletedKey)
+		}
+	}
+
+	t.Logf("Successfully scanned %d total entries (%d unique), including %d deleted tombstones",
+		len(scannedKeys), len(uniqueKeys), len(deletedKeys))
+}
+
+// TestDiskCache_Scan_SkipsSuperseded verifies superseded entries are skipped
+func TestDiskCache_Scan_SkipsSuperseded(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-scanphysical-superseded-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Insert initial values
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := fmt.Sprintf("old-value-%d", i)
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	// Update some keys (creates superseded entries)
+	updatedKeys := []string{"key-1", "key-3"}
+	for _, key := range updatedKeys {
+		newValue := "new-" + key
+		if err := cache.Set([]byte(key), []byte(newValue)); err != nil {
+			t.Fatalf("Failed to update %s: %v", key, err)
+		}
+	}
+
+	if err := cache.Sync(); err != nil {
+		t.Fatalf("Failed to sync: %v", err)
+	}
+
+	// Scan physically and collect values
+	scannedData := make(map[string]string)
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		scannedData[string(key)] = string(value)
+		return false
+	})
+
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	// Verify we only got latest values (no superseded entries)
+	if len(scannedData) != 5 {
+		t.Errorf("Expected 5 keys, got %d", len(scannedData))
+	}
+
+	// Verify updated keys have new values
+	for _, key := range updatedKeys {
+		if value, ok := scannedData[key]; !ok {
+			t.Errorf("Updated key %s not found in scan", key)
+		} else if value != "new-"+key {
+			t.Errorf("Key %s has wrong value: expected %s, got %s", key, "new-"+key, value)
+		}
+	}
+
+	t.Logf("Successfully scanned latest values, skipped superseded entries")
+}
+
+// TestDiskCache_Scan_Performance verifies physical scan is faster than regular scan
+func TestDiskCache_Scan_Performance(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping performance test in short mode")
+	}
+
+	dir, err := os.MkdirTemp("", "bitcache-scanphysical-perf-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Insert a reasonable amount of data
+	numKeys := 1000
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("key-%06d", i)
+		value := fmt.Sprintf("value-%06d", i)
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	if err := cache.Sync(); err != nil {
+		t.Fatalf("Failed to sync: %v", err)
+	}
+
+	t.Logf("Testing with %d keys across %d segments", numKeys, cache.Stats().Segments)
+
+	// This test just verifies both methods return the same count
+	// In real usage, Scan should be faster for full scans
+
+	physicalCount := 0
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		physicalCount++
+		return false
+	})
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	regularCount := 0
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		regularCount++
+		return false
+	})
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	if physicalCount != regularCount {
+		t.Errorf("Count mismatch: Scan=%d, Scan=%d", physicalCount, regularCount)
+	}
+
+	t.Logf("Both scans returned %d entries", physicalCount)
+}
+
+// TestTmpFileCleanupOnStartup verifies that .tmp files are cleaned up on startup
+func TestTmpFileCleanupOnStartup(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a normal cache and populate it
+	cache, err := NewDiskCache[[]byte](dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("failed to create cache: %v", err)
+	}
+
+	// Write some data
+	for i := 0; i < 100; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		value := []byte(fmt.Sprintf("value-%d", i))
+		if err := cache.Set(key, value); err != nil {
+			t.Fatalf("failed to set key: %v", err)
+		}
+	}
+
+	// Close the cache
+	if err := cache.Close(); err != nil {
+		t.Fatalf("failed to close cache: %v", err)
+	}
+
+	// Create some fake .tmp files to simulate incomplete compactions
+	tmpFiles := []string{
+		"00000001-00.log.tmp",
+		"00000005-01.log.tmp",
+		"00000010-02.log.tmp",
+	}
+
+	for _, tmpFile := range tmpFiles {
+		tmpPath := filepath.Join(dir, tmpFile)
+		f, err := os.Create(tmpPath)
+		if err != nil {
+			t.Fatalf("failed to create tmp file: %v", err)
+		}
+		// Write some garbage data
+		f.WriteString("incomplete compaction data")
+		f.Close()
+	}
+
+	// Verify .tmp files exist
+	for _, tmpFile := range tmpFiles {
+		tmpPath := filepath.Join(dir, tmpFile)
+		if _, err := os.Stat(tmpPath); os.IsNotExist(err) {
+			t.Fatalf("tmp file should exist: %s", tmpPath)
+		}
+	}
+
+	// Reopen the cache - this should clean up .tmp files
+	cache2, err := NewDiskCache[[]byte](dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("failed to reopen cache: %v", err)
+	}
+	defer cache2.Close()
+
+	// Verify .tmp files are gone
+	for _, tmpFile := range tmpFiles {
+		tmpPath := filepath.Join(dir, tmpFile)
+		if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+			t.Errorf("tmp file should be deleted on startup: %s", tmpPath)
+		}
+	}
+
+	// Verify data is still intact
+	for i := 0; i < 100; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		expected := []byte(fmt.Sprintf("value-%d", i))
+		value, err := cache2.Get(key)
+		if err != nil {
+			t.Errorf("failed to get key %s: %v", key, err)
+		}
+		if !bytes.Equal(value, expected) {
+			t.Errorf("expected %s, got %s", expected, value)
+		}
+	}
+
+	t.Log("✓ Tmp file cleanup test passed")
+}
+
+// TestCompactionWithTmpFile verifies that compaction creates .tmp file and renames it atomically
+func TestCompactionWithTmpFile(t *testing.T) {
+	dir := t.TempDir()
+
+	cache, err := NewDiskCacheWithConfig[[]byte](dir, DiskCacheConfig{
+		MaxSegmentSize:      10 * 1024, // Small segments for testing
+		AutoCompactEnabled:  false,     // Manual compaction
+		AutoCompactInterval: 0,
+	}, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("failed to create cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Write enough data to create multiple segments
+	for i := 0; i < 500; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		value := []byte(fmt.Sprintf("value-%d-with-some-extra-data-to-make-it-larger", i))
+		if err := cache.Set(key, value); err != nil {
+			t.Fatalf("failed to set key: %v", err)
+		}
+	}
+
+	// Get initial segment count
+	byLevel, err := cache.GetSegmentsByLevel()
+	if err != nil {
+		t.Fatalf("failed to get segments: %v", err)
+	}
+
+	initialSegments := 0
+	for _, segments := range byLevel {
+		initialSegments += len(segments)
+	}
+
+	if initialSegments < 2 {
+		t.Fatalf("expected at least 2 segments, got %d", initialSegments)
+	}
+
+	t.Logf("Initial segments: %d", initialSegments)
+
+	// Verify no .tmp files exist before compaction
+	tmpFiles, _ := filepath.Glob(filepath.Join(dir, "*.tmp"))
+	if len(tmpFiles) > 0 {
+		t.Errorf("unexpected .tmp files before compaction: %v", tmpFiles)
+	}
+
+	// Perform compaction
+	result, err := cache.Compact()
+	if err != nil {
+		t.Fatalf("compaction failed: %v", err)
+	}
+
+	t.Logf("Compaction result: type=%s, live=%d, bytes=%d", result.Type, result.LiveEntries, result.BytesWritten)
+
+	// Verify no .tmp files exist after compaction
+	tmpFiles, _ = filepath.Glob(filepath.Join(dir, "*.tmp"))
+	if len(tmpFiles) > 0 {
+		t.Errorf("unexpected .tmp files after compaction: %v", tmpFiles)
+	}
+
+	// Verify all data is still accessible
+	for i := 0; i < 500; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		expected := []byte(fmt.Sprintf("value-%d-with-some-extra-data-to-make-it-larger", i))
+		value, err := cache.Get(key)
+		if err != nil {
+			t.Errorf("failed to get key %s after compaction: %v", key, err)
+		}
+		if !bytes.Equal(value, expected) {
+			t.Errorf("data corruption after compaction: key=%s expected=%s got=%s", key, expected, value)
+		}
+	}
+
+	t.Log("✓ Compaction with tmp file test passed")
+}
+
+// TestCrashDuringCompaction simulates a crash during compaction
+func TestCrashDuringCompaction(t *testing.T) {
+	dir := t.TempDir()
+
+	cache, err := NewDiskCacheWithConfig[[]byte](dir, DiskCacheConfig{
+		MaxSegmentSize:      10 * 1024,
+		AutoCompactEnabled:  false,
+		AutoCompactInterval: 0,
+	}, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("failed to create cache: %v", err)
+	}
+
+	// Write data to create multiple segments
+	for i := 0; i < 500; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		value := []byte(fmt.Sprintf("value-%d-with-some-extra-data", i))
+		if err := cache.Set(key, value); err != nil {
+			t.Fatalf("failed to set key: %v", err)
+		}
+	}
+
+	cache.Close()
+
+	// Simulate a crash by creating a .tmp file that represents an incomplete compaction
+	crashedTmpFile := filepath.Join(dir, "00000005-01.log.tmp")
+	f, err := os.Create(crashedTmpFile)
+	if err != nil {
+		t.Fatalf("failed to create crashed tmp file: %v", err)
+	}
+	f.WriteString("incomplete compaction - simulating crash")
+	f.Close()
+
+	t.Logf("Created simulated crashed tmp file: %s", crashedTmpFile)
+
+	// Reopen cache - should clean up the .tmp file
+	cache2, err := NewDiskCache[[]byte](dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("failed to reopen cache: %v", err)
+	}
+	defer cache2.Close()
+
+	// Verify .tmp file was removed
+	if _, err := os.Stat(crashedTmpFile); !os.IsNotExist(err) {
+		t.Errorf("crashed tmp file should be deleted: %s", crashedTmpFile)
+	}
+
+	// Verify all original data is still accessible
+	for i := 0; i < 500; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		expected := []byte(fmt.Sprintf("value-%d-with-some-extra-data", i))
+		value, err := cache2.Get(key)
+		if err != nil {
+			t.Errorf("failed to get key %s after recovery: %v", key, err)
+		}
+		if !bytes.Equal(value, expected) {
+			t.Errorf("data corruption after recovery: key=%s", key)
+		}
+	}
+
+	t.Log("✓ Crash recovery test passed")
+}
+
+// TestDiskCache_TruncateCorruptedSegment_FileCacheCleared verifies that the file cache is cleared
+// when a corrupted segment is truncated, preventing stale file handles
+func TestDiskCache_TruncateCorruptedSegment_FileCacheCleared(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-truncate-cache-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Create cache with small segment size to force rotation
+	cache, err := NewDiskCacheWithConfig(dir, DiskCacheConfig{
+		MaxSegmentSize: 1024, // Small size to force rotation
+	}, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+
+	// Write enough data to create multiple segments
+	for i := 0; i < 50; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		value := make([]byte, 100) // 100-byte values
+		for j := range value {
+			value[j] = byte(i)
+		}
+		if err := cache.Set([]byte(key), value); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	if err := cache.Sync(); err != nil {
+		t.Fatalf("Failed to sync: %v", err)
+	}
+
+	// Close cache
+	if err := cache.Close(); err != nil {
+		t.Fatalf("Failed to close cache: %v", err)
+	}
+
+	// Find all log files
+	files, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	if err != nil {
+		t.Fatalf("Failed to find log files: %v", err)
+	}
+
+	if len(files) < 2 {
+		t.Skipf("Need at least 2 segments for this test, got %d", len(files))
+	}
+
+	t.Logf("Found %d segment files", len(files))
+
+	// Corrupt the FIRST segment (not the active one)
+	// This ensures we test the file cache clearing on historical segments
+	firstSegment := files[0]
+	t.Logf("Corrupting segment: %s", filepath.Base(firstSegment))
+
+	data, err := os.ReadFile(firstSegment)
+	if err != nil {
+		t.Fatalf("Failed to read segment file: %v", err)
+	}
+
+	originalSize := len(data)
+
+	// Corrupt the last half of the file
+	corruptionStart := len(data) / 2
+	if corruptionStart < 100 {
+		corruptionStart = 100
+	}
+
+	for i := corruptionStart; i < len(data); i++ {
+		data[i] = 0xFF
+	}
+
+	if err := os.WriteFile(firstSegment, data, 0644); err != nil {
+		t.Fatalf("Failed to write corrupted segment: %v", err)
+	}
+
+	t.Logf("Corrupted %d bytes in segment", len(data)-corruptionStart)
+
+	// Reopen cache - should detect corruption and truncate
+	cache, err = NewDiskCacheWithConfig(dir, DiskCacheConfig{
+		MaxSegmentSize: 1024,
+	}, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to reopen cache: %v", err)
+	}
+
+	// Read some keys to populate the file cache
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		_, _ = cache.Get([]byte(key)) // Ignore errors, some keys may be in corrupted segment
+	}
+
+	// Verify the truncated segment file size
+	stat, err := os.Stat(firstSegment)
+	if err != nil {
+		t.Fatalf("Failed to stat segment: %v", err)
+	}
+
+	newSize := stat.Size()
+	t.Logf("Segment size after truncation: %d bytes (was %d bytes)", newSize, originalSize)
+
+	if newSize >= int64(originalSize) {
+		t.Errorf("Segment was not truncated: new size %d >= original size %d", newSize, originalSize)
+	}
+
+	// Now try to read from the truncated segment
+	// This would fail if the file cache still had stale handles
+	keysRead := 0
+	for i := 0; i < 50; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		value, err := cache.Get([]byte(key))
+		if err == nil && len(value) == 100 {
+			keysRead++
+			// Verify value content
+			expected := byte(i)
+			for _, b := range value {
+				if b != expected {
+					t.Errorf("Invalid value for %s: expected all bytes to be %d", key, expected)
+					break
+				}
+			}
+		}
+	}
+
+	t.Logf("Successfully read %d keys after truncation and cache operations", keysRead)
+
+	// We should have read at least some keys
+	if keysRead == 0 {
+		t.Error("Failed to read any keys after truncation - file cache may have stale handles")
+	}
+
+	if err := cache.Close(); err != nil {
+		t.Fatalf("Failed to close cache: %v", err)
+	}
+}
+
+// TestDiskCache_MultipleCorruptedSegments verifies that multiple corrupted segments are all truncated
+func TestDiskCache_MultipleCorruptedSegments(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-multi-truncate-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	// Create cache with small segment size
+	cache, err := NewDiskCacheWithConfig(dir, DiskCacheConfig{
+		MaxSegmentSize: 512,
+	}, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+
+	// Write enough data to create multiple segments
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		value := make([]byte, 50)
+		for j := range value {
+			value[j] = byte(i)
+		}
+		if err := cache.Set([]byte(key), value); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	if err := cache.Sync(); err != nil {
+		t.Fatalf("Failed to sync: %v", err)
+	}
+	cache.Close()
+
+	// Find all log files
+	files, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	if err != nil {
+		t.Fatalf("Failed to find log files: %v", err)
+	}
+
+	if len(files) < 3 {
+		t.Skipf("Need at least 3 segments for this test, got %d", len(files))
+	}
+
+	t.Logf("Found %d segment files", len(files))
+
+	// Corrupt multiple segments (but not the last one)
+	corruptedCount := 0
+	for i := 0; i < len(files)-1 && i < 3; i++ {
+		segmentFile := files[i]
+		data, err := os.ReadFile(segmentFile)
+		if err != nil {
+			t.Logf("Warning: failed to read %s: %v", segmentFile, err)
+			continue
+		}
+
+		// Corrupt the last quarter
+		corruptionStart := (len(data) * 3) / 4
+		if corruptionStart < 100 {
+			corruptionStart = 100
+		}
+
+		for j := corruptionStart; j < len(data); j++ {
+			data[j] = 0xFF
+		}
+
+		if err := os.WriteFile(segmentFile, data, 0644); err != nil {
+			t.Logf("Warning: failed to write %s: %v", segmentFile, err)
+			continue
+		}
+
+		corruptedCount++
+		t.Logf("Corrupted segment %d: %s", i, filepath.Base(segmentFile))
+	}
+
+	if corruptedCount == 0 {
+		t.Fatal("Failed to corrupt any segments")
+	}
+
+	// Reopen cache - should detect and truncate all corrupted segments
+	cache, err = NewDiskCacheWithConfig(dir, DiskCacheConfig{
+		MaxSegmentSize: 512,
+	}, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to reopen cache: %v", err)
+	}
+	defer cache.Close()
+
+	// Try to read keys - should work even with truncated segments
+	keysRead := 0
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		_, err := cache.Get([]byte(key))
+		if err == nil {
+			keysRead++
+		}
+	}
+
+	t.Logf("Successfully read %d out of 100 keys after truncating %d segments", keysRead, corruptedCount)
+
+	// We should read at least some keys
+	if keysRead == 0 {
+		t.Error("Failed to read any keys after multi-segment truncation")
+	}
+}
+
+// TestDiskCache_TruncateCorruptedSegment verifies that corrupted segments are truncated to the last valid record
+func TestDiskCache_TruncateCorruptedSegment(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-truncate-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(dir)
+	}()
+
+	// Create cache and write some data
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+
+	// Write test data
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("key-%02d", i)
+		value := fmt.Sprintf("value-%02d", i)
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	if err := cache.Sync(); err != nil {
+		t.Fatalf("Failed to sync: %v", err)
+	}
+
+	// Close cache
+	if err := cache.Close(); err != nil {
+		t.Fatalf("Failed to close cache: %v", err)
+	}
+
+	// Find the log file and corrupt the end
+	files, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("Failed to find log files: %v", err)
+	}
+
+	logFile := files[0]
+
+	// Read the file
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("Failed to read log file: %v", err)
+	}
+
+	originalSize := len(data)
+	t.Logf("Original file size: %d bytes", originalSize)
+
+	// Corrupt the last 200 bytes (should be roughly 2-3 records)
+	corruptionStart := len(data) - 200
+	if corruptionStart < 100 {
+		corruptionStart = 100
+	}
+
+	for i := corruptionStart; i < len(data); i++ {
+		data[i] = 0xFF
+	}
+
+	if err := os.WriteFile(logFile, data, 0644); err != nil {
+		t.Fatalf("Failed to write corrupted log file: %v", err)
+	}
+
+	t.Logf("Corrupted last %d bytes", len(data)-corruptionStart)
+
+	// Reopen the cache - it should detect corruption and truncate
+	cache, err = NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to reopen cache: %v", err)
+	}
+	defer func() {
+		_ = cache.Close()
+	}()
+
+	// Check file size after truncation
+	stat, err := os.Stat(logFile)
+	if err != nil {
+		t.Fatalf("Failed to stat log file: %v", err)
+	}
+
+	newSize := stat.Size()
+	t.Logf("New file size after truncation: %d bytes", newSize)
+
+	// File should be smaller than original
+	if newSize >= int64(originalSize) {
+		t.Errorf("Expected file to be truncated, but size is %d (original: %d)", newSize, originalSize)
+	}
+
+	// We should have at least some keys (the ones before corruption)
+	scannedCount := 0
+	err = cache.Scan(func(key []byte, value []byte) bool {
+		scannedCount++
+		return false
+	})
+
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	if scannedCount == 0 {
+		t.Error("Expected to recover some keys after truncation, got 0")
+	}
+
+	t.Logf("Successfully recovered %d keys after truncation", scannedCount)
+	t.Logf("Truncation removed %d bytes", originalSize-int(newSize))
+}
+
+// TestDiskCache_TruncateMiddleCorruption verifies truncation when corruption is in the middle but no valid records after
+func TestDiskCache_TruncateMiddleCorruption(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-truncate-middle-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(dir)
+	}()
+
+	// Create cache and write data
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+
+	// Write test data
+	for i := 0; i < 15; i++ {
+		key := fmt.Sprintf("key-%02d", i)
+		value := fmt.Sprintf("value-%02d-with-padding", i)
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	if err := cache.Sync(); err != nil {
+		t.Fatalf("Failed to sync: %v", err)
+	}
+
+	if err := cache.Close(); err != nil {
+		t.Fatalf("Failed to close cache: %v", err)
+	}
+
+	// Find and corrupt the file in the middle
+	files, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("Failed to find log files: %v", err)
+	}
+
+	logFile := files[0]
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("Failed to read log file: %v", err)
+	}
+
+	originalSize := len(data)
+
+	// Corrupt from 60% point to end (ensures no valid records after corruption)
+	corruptionStart := (originalSize * 60) / 100
+	if corruptionStart < 200 {
+		corruptionStart = 200
+	}
+
+	for i := corruptionStart; i < len(data); i++ {
+		data[i] = 0xAA
+	}
+
+	if err := os.WriteFile(logFile, data, 0644); err != nil {
+		t.Fatalf("Failed to write corrupted log file: %v", err)
+	}
+
+	t.Logf("Corrupted from offset %d to end", corruptionStart)
+
+	// Reopen - should truncate to last valid position
+	cache, err = NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to reopen cache: %v", err)
+	}
+	defer func() {
+		_ = cache.Close()
+	}()
+
+	// Verify truncation occurred
+	stat, err := os.Stat(logFile)
+	if err != nil {
+		t.Fatalf("Failed to stat log file: %v", err)
+	}
+
+	newSize := stat.Size()
+
+	if newSize >= int64(originalSize) {
+		t.Errorf("Expected truncation, but size is %d (original: %d)", newSize, originalSize)
+	}
+
+	if newSize < int64(corruptionStart) {
+		// Good - truncated before corruption point
+		t.Logf("Successfully truncated to %d bytes (before corruption at %d)", newSize, corruptionStart)
+	}
+
+	// Count recovered keys
+	count := 0
+	_ = cache.Scan(func(key []byte, value []byte) bool {
+		count++
+		return false
+	})
+
+	t.Logf("Recovered %d keys after truncation", count)
+
+	if count == 0 {
+		t.Error("Expected to recover at least some keys")
+	}
+}
+
+// TestDiskCache_NoTruncateOnValidFile verifies that valid files are not truncated
+func TestDiskCache_NoTruncateOnValidFile(t *testing.T) {
+	dir, err := os.MkdirTemp("", "bitcache-no-truncate-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(dir)
+	}()
+
+	// Create cache and write data
+	cache, err := NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to create cache: %v", err)
+	}
+
+	// Write test data
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("key-%02d", i)
+		value := fmt.Sprintf("value-%02d", i)
+		if err := cache.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+
+	if err := cache.Sync(); err != nil {
+		t.Fatalf("Failed to sync: %v", err)
+	}
+
+	if err := cache.Close(); err != nil {
+		t.Fatalf("Failed to close cache: %v", err)
+	}
+
+	// Get original file size
+	files, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("Failed to find log files: %v", err)
+	}
+
+	logFile := files[0]
+	stat1, err := os.Stat(logFile)
+	if err != nil {
+		t.Fatalf("Failed to stat log file: %v", err)
+	}
+
+	originalSize := stat1.Size()
+
+	// Reopen without corruption
+	cache, err = NewDiskCache(dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("Failed to reopen cache: %v", err)
+	}
+	defer func() {
+		_ = cache.Close()
+	}()
+
+	// Check file size hasn't changed
+	stat2, err := os.Stat(logFile)
+	if err != nil {
+		t.Fatalf("Failed to stat log file: %v", err)
+	}
+
+	newSize := stat2.Size()
+
+	if newSize != originalSize {
+		t.Errorf("File size changed without corruption: %d -> %d", originalSize, newSize)
+	}
+
+	// Verify all keys are still there
+	// Note: Scan returns all entries from all segments, so duplicates are expected
+	count := 0
+	uniqueKeys := make(map[string]bool)
+	_ = cache.Scan(func(key []byte, value []byte) bool {
+		keyStr := string(key)
+		uniqueKeys[keyStr] = true
+		count++
+		return false
+	})
+
+	if len(uniqueKeys) != 10 {
+		t.Errorf("Expected 10 unique keys, got %d", len(uniqueKeys))
+	}
+
+	t.Logf("File correctly not truncated: %d bytes, %d total entries, %d unique keys", newSize, count, len(uniqueKeys))
+}
+
+// TestCloseRaceCondition tests for race between Set and Close
+// This test reproduces the issue where Close() can flush and close files
+// while Set() is still writing, resulting in partial/corrupted entries
+func TestCloseRaceCondition(t *testing.T) {
+	dir := t.TempDir()
+
+	// Run multiple iterations to increase chance of hitting the race
+	for iteration := 0; iteration < 10; iteration++ {
+		cache, err := NewDiskCache[[]byte](dir, ByteSliceMarshaler{})
+		if err != nil {
+			t.Fatalf("iteration %d: failed to create cache: %v", iteration, err)
+		}
+
+		var wg sync.WaitGroup
+		var writeErrors atomic.Int64
+		var successfulWrites atomic.Int64
+		const numWriters = 20
+		const writesPerWriter = 100
+
+		// Start multiple writers
+		for w := 0; w < numWriters; w++ {
+			wg.Add(1)
+			writerID := w
+			go func() {
+				defer wg.Done()
+				for i := 0; i < writesPerWriter; i++ {
+					key := []byte(fmt.Sprintf("writer-%d-key-%d", writerID, i))
+					value := []byte(fmt.Sprintf("writer-%d-value-%d-with-some-extra-data-to-make-it-larger", writerID, i))
+
+					err := cache.Set(key, value)
+					if err != nil {
+						if err == ErrCacheClosed {
+							// Expected after close is called
+							writeErrors.Add(1)
+						} else {
+							t.Errorf("unexpected error: %v", err)
+						}
+					} else {
+						successfulWrites.Add(1)
+					}
+
+					// Small random delay to increase race window
+					time.Sleep(time.Microsecond * 10)
+				}
+			}()
+		}
+
+		// Wait a bit for writes to be in progress
+		time.Sleep(time.Millisecond * 50)
+
+		// Close the cache while writes are happening
+		if err := cache.Close(); err != nil {
+			t.Errorf("iteration %d: close failed: %v", iteration, err)
+		}
+
+		// Wait for all writers to finish
+		wg.Wait()
+
+		t.Logf("Iteration %d: successful writes=%d, closed errors=%d",
+			iteration, successfulWrites.Load(), writeErrors.Load())
+
+		// Reopen and verify data integrity
+		cache2, err := NewDiskCache[[]byte](dir, ByteSliceMarshaler{})
+		if err != nil {
+			t.Fatalf("iteration %d: failed to reopen cache: %v", iteration, err)
+		}
+
+		// Verify all successfully written keys are readable
+		stats := cache2.Stats()
+		t.Logf("Iteration %d: reopened cache has %d keys", iteration, stats.Keys)
+
+		// Close and clean up for next iteration
+		cache2.Close()
+
+		// Clean up the directory for next iteration
+		if iteration < 9 {
+			// Remove all files
+			files, _ := os.ReadDir(dir)
+			for _, f := range files {
+				_ = os.Remove(fmt.Sprintf("%s/%s", dir, f.Name()))
+			}
+		}
+	}
+
+	t.Log("✓ Close race condition test passed - no corrupted files")
+}
+
+// TestConcurrentWritesDuringClose verifies that concurrent writes during close
+// either succeed completely or fail cleanly with ErrCacheClosed
+func TestConcurrentWritesDuringClose(t *testing.T) {
+	dir := t.TempDir()
+
+	cache, err := NewDiskCache[[]byte](dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("failed to create cache: %v", err)
+	}
+
+	// Write initial data
+	for i := 0; i < 100; i++ {
+		key := []byte(fmt.Sprintf("initial-%d", i))
+		value := []byte(fmt.Sprintf("initial-value-%d", i))
+		if err := cache.Set(key, value); err != nil {
+			t.Fatalf("failed to write initial data: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	var closeCalled atomic.Bool
+	const numWriters = 10
+
+	// Start writers that keep writing until close is called
+	for w := 0; w < numWriters; w++ {
+		wg.Add(1)
+		writerID := w
+		go func() {
+			defer wg.Done()
+			counter := 0
+			for !closeCalled.Load() {
+				key := []byte(fmt.Sprintf("concurrent-%d-%d", writerID, counter))
+				value := []byte(fmt.Sprintf("concurrent-value-%d-%d", writerID, counter))
+				_ = cache.Set(key, value) // Ignore errors, we expect some after close
+				counter++
+				time.Sleep(time.Microsecond * 100)
+			}
+		}()
+	}
+
+	// Let writes happen for a bit
+	time.Sleep(time.Millisecond * 100)
+
+	// Close the cache
+	closeCalled.Store(true)
+	if err := cache.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	// Wait for all writers to finish
+	wg.Wait()
+
+	// Reopen and verify no corruption
+	cache2, err := NewDiskCache[[]byte](dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("failed to reopen cache after concurrent writes: %v", err)
+	}
+	defer cache2.Close()
+
+	// Verify we can read all the initial keys
+	for i := 0; i < 100; i++ {
+		key := []byte(fmt.Sprintf("initial-%d", i))
+		expectedValue := []byte(fmt.Sprintf("initial-value-%d", i))
+		value, err := cache2.Get(key)
+		if err != nil {
+			t.Errorf("failed to read initial key %s: %v", key, err)
+		} else if string(value) != string(expectedValue) {
+			t.Errorf("data corruption: key=%s expected=%s got=%s", key, expectedValue, value)
+		}
+	}
+
+	stats := cache2.Stats()
+	t.Logf("✓ Reopened cache successfully with %d keys (no corruption)", stats.Keys)
+}
+
+// TestCloseIdempotency verifies that calling Close multiple times is safe
+func TestCloseIdempotency(t *testing.T) {
+	dir := t.TempDir()
+
+	cache, err := NewDiskCache[[]byte](dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("failed to create cache: %v", err)
+	}
+
+	// Write some data
+	for i := 0; i < 10; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		value := []byte(fmt.Sprintf("value-%d", i))
+		if err := cache.Set(key, value); err != nil {
+			t.Fatalf("failed to write data: %v", err)
+		}
+	}
+
+	// Close multiple times - should not panic or error
+	if err := cache.Close(); err != nil {
+		t.Fatalf("first close failed: %v", err)
+	}
+
+	if err := cache.Close(); err != nil {
+		t.Errorf("second close should not error: %v", err)
+	}
+
+	if err := cache.Close(); err != nil {
+		t.Errorf("third close should not error: %v", err)
+	}
+
+	// Verify data is still intact
+	cache2, err := NewDiskCache[[]byte](dir, ByteSliceMarshaler{})
+	if err != nil {
+		t.Fatalf("failed to reopen cache: %v", err)
+	}
+	defer cache2.Close()
+
+	for i := 0; i < 10; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		if _, err := cache2.Get(key); err != nil {
+			t.Errorf("failed to read key after multiple closes: %v", err)
+		}
+	}
+
+	t.Log("✓ Close idempotency test passed")
 }

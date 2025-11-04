@@ -68,8 +68,18 @@ type DiskCache[V any] struct {
 	// File caching for efficient reads
 	fileCache      map[uint32]*cachedFile
 	fileCacheMutex sync.RWMutex
+	// In-memory segment tracking for efficient compaction
+	segments      map[segmentID]*segmentInfo
+	segmentsMutex sync.RWMutex
+	// Auto-compaction
+	autoCompactDone chan struct{} // Signals auto-compaction goroutine to stop
+	// Buffer pools for reducing allocations
+	headerPool *sync.Pool
+	entryPool  *sync.Pool
 	// Configuration
-	maxSegmentSize int64
+	maxSegmentSize      int64
+	autoCompactEnabled  bool
+	autoCompactInterval time.Duration
 	// Marshaling
 	marshaler Marshaler[V]
 }
@@ -79,6 +89,12 @@ type DiskCacheConfig struct {
 	// MaxSegmentSize is the maximum size of a segment file before rotation
 	// If 0, defaults to 16MB
 	MaxSegmentSize int64
+	// AutoCompactEnabled enables automatic background compaction
+	// If false, compaction must be triggered manually via Compact()
+	AutoCompactEnabled bool
+	// AutoCompactInterval is the time between automatic compaction checks
+	// If 0, defaults to 5 minutes
+	AutoCompactInterval time.Duration
 }
 
 // keyEntry represents an entry in the in-memory key directory
@@ -145,12 +161,33 @@ func NewDiskCacheWithConfig[V any](dir string, config DiskCacheConfig, marshaler
 		maxSegSize = maxFileSize
 	}
 
+	// Set default auto-compaction interval if not specified
+	autoCompactInterval := config.AutoCompactInterval
+	if autoCompactInterval <= 0 {
+		autoCompactInterval = 5 * time.Minute
+	}
+
 	cache := &DiskCache[V]{
 		dir: dir,
 		// Initialize the file cache
-		fileCache:      make(map[uint32]*cachedFile),
-		maxSegmentSize: maxSegSize,
-		marshaler:      marshaler,
+		fileCache:           make(map[uint32]*cachedFile),
+		maxSegmentSize:      maxSegSize,
+		marshaler:           marshaler,
+		segments:            make(map[segmentID]*segmentInfo),
+		autoCompactEnabled:  config.AutoCompactEnabled,
+		autoCompactInterval: autoCompactInterval,
+		// Initialize buffer pools
+		headerPool: &sync.Pool{
+			New: func() interface{} {
+				buf := make([]byte, headerSize)
+				return &buf
+			},
+		},
+		entryPool: &sync.Pool{
+			New: func() interface{} {
+				return &logEntry{}
+			},
+		},
 	}
 
 	// Initialize the keydir with an empty btree
@@ -165,6 +202,12 @@ func NewDiskCacheWithConfig[V any](dir string, config DiskCacheConfig, marshaler
 	// Open current log file for appending
 	if err := cache.openLogFile(); err != nil {
 		return nil, fmt.Errorf("failed to open log file: %w", err)
+	}
+
+	// Start auto-compaction if enabled
+	if cache.autoCompactEnabled {
+		cache.autoCompactDone = make(chan struct{})
+		go cache.autoCompactionLoop()
 	}
 
 	return cache, nil
@@ -308,6 +351,127 @@ func (c *DiskCache[V]) Set(key []byte, value V) error {
 	return nil
 }
 
+// BatchSet performs bulk inserts for maximum performance
+func (c *DiskCache[V]) BatchSet(entries []struct {
+	Key   []byte
+	Value V
+}) error {
+	if c.isClosed() {
+		return ErrCacheClosed
+	}
+
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// Prepare all entries and marshal values WITHOUT holding lock
+	type preparedEntry struct {
+		keyStr    string
+		logEntry  *logEntry
+		oldEntry  *keyEntry
+		oldExists bool
+	}
+
+	prepared := make([]preparedEntry, 0, len(entries))
+	timestamp := uint32(time.Now().Unix())
+
+	for _, entry := range entries {
+		// Marshal the value to bytes
+		data, err := c.marshaler.Marshal(entry.Value)
+		if err != nil {
+			return fmt.Errorf("failed to marshal value: %w", err)
+		}
+
+		// Prepare log entry and calculate CRC
+		logEnt := &logEntry{
+			timestamp: timestamp,
+			keySize:   uint32(len(entry.Key)),
+			valueSize: uint32(len(data)),
+			key:       entry.Key,
+			value:     data,
+			deleted:   false,
+		}
+		logEnt.crc = c.calculateCRC(logEnt)
+
+		// Check if key exists (lock-free)
+		keyStr := string(entry.Key)
+		oldEntry, oldExists := c.getKeyEntry(keyStr)
+
+		prepared = append(prepared, preparedEntry{
+			keyStr:    keyStr,
+			logEntry:  logEnt,
+			oldEntry:  oldEntry,
+			oldExists: oldExists,
+		})
+	}
+
+	// Now acquire write lock and write all entries
+	c.mu.Lock()
+
+	// Double-check closed after acquiring lock
+	if c.isClosed() {
+		c.mu.Unlock()
+		return ErrCacheClosed
+	}
+
+	// Write all entries and collect their offsets
+	type writeResult struct {
+		keyStr   string
+		fileID   uint32
+		offset   int64
+		size     uint32
+		isNewKey bool
+	}
+
+	results := make([]writeResult, 0, len(prepared))
+
+	for _, prep := range prepared {
+		offset, err := c.writeLogEntry(prep.logEntry)
+		if err != nil {
+			c.mu.Unlock()
+			return fmt.Errorf("failed to write log entry: %w", err)
+		}
+
+		isNewKey := !prep.oldExists || (prep.oldEntry != nil && prep.oldEntry.deleted)
+
+		results = append(results, writeResult{
+			keyStr:   prep.keyStr,
+			fileID:   c.activeFileID,
+			offset:   offset,
+			size:     headerSize + prep.logEntry.keySize + prep.logEntry.valueSize,
+			isNewKey: isNewKey,
+		})
+	}
+
+	c.mu.Unlock()
+
+	// Update keydir for all entries WITHOUT holding c.mu
+	var newKeys int64
+	var totalSize int64
+
+	for _, result := range results {
+		c.setKeyEntry(result.keyStr, &keyEntry{
+			fileID:    result.fileID,
+			offset:    result.offset,
+			size:      result.size,
+			timestamp: timestamp,
+			deleted:   false,
+		})
+
+		if result.isNewKey {
+			newKeys++
+		}
+		totalSize += int64(result.size)
+	}
+
+	// Update stats (atomic operations)
+	atomic.AddInt64(&c.stats.Keys, newKeys)
+	atomic.AddInt64(&c.stats.Writes, int64(len(entries)))
+	atomic.AddInt64(&c.stats.DataSize, totalSize)
+
+	return nil
+}
+
 // Delete removes a key from the cache
 func (c *DiskCache[V]) Delete(key []byte) error {
 	// Quick closed check without lock
@@ -391,14 +555,22 @@ func (c *DiskCache[V]) Has(key []byte) bool {
 
 // Close closes the cache and flushes any pending writes
 func (c *DiskCache[V]) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.isClosed() {
+	// Set closed flag FIRST (before acquiring lock) to reject any new writes
+	// This prevents race condition where a write can pass the closed check,
+	// acquire the lock, and partially write data before Close() flushes
+	if !c.closed.CompareAndSwap(false, true) {
+		// Already closed
 		return nil
 	}
 
-	c.closed.Store(true)
+	// Stop auto-compaction (without holding mu)
+	if c.autoCompactEnabled && c.autoCompactDone != nil {
+		close(c.autoCompactDone)
+	}
+
+	// Now acquire lock to safely flush and close files
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	if c.activeWriter != nil {
 		if err := c.activeWriter.Flush(); err != nil {
@@ -426,6 +598,55 @@ func (c *DiskCache[V]) Close() error {
 	c.fileCacheMutex.Unlock()
 
 	return nil
+}
+
+// autoCompactionLoop runs in a separate goroutine and periodically calls Compact
+func (c *DiskCache[V]) autoCompactionLoop() {
+	ticker := time.NewTicker(c.autoCompactInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.autoCompactDone:
+			return
+		case <-ticker.C:
+			// Skip if cache is closed
+			if c.isClosed() {
+				return
+			}
+
+			// Run compaction (errors are logged but don't stop the loop)
+			result, err := c.Compact()
+			if err != nil {
+				// Log error but continue
+				fmt.Printf("Auto-compaction error: %v\n", err)
+			} else if result != nil && result.Type != "none" {
+				// Log successful compaction
+				fmt.Printf("Auto-compaction completed: type=%s level=%d live=%d bytes=%d\n",
+					result.Type, result.Level, result.LiveEntries, result.BytesWritten)
+			}
+		}
+	}
+}
+
+// registerSegment adds a segment to the in-memory tracking
+func (c *DiskCache[V]) registerSegment(id segmentID, path string, totalBytes int64) {
+	c.segmentsMutex.Lock()
+	defer c.segmentsMutex.Unlock()
+
+	c.segments[id] = &segmentInfo{
+		id:         id,
+		path:       path,
+		totalBytes: totalBytes,
+	}
+}
+
+// unregisterSegment removes a segment from in-memory tracking
+func (c *DiskCache[V]) unregisterSegment(id segmentID) {
+	c.segmentsMutex.Lock()
+	defer c.segmentsMutex.Unlock()
+
+	delete(c.segments, id)
 }
 
 // Sync forces a sync of any pending writes to disk
@@ -465,10 +686,10 @@ func (c *DiskCache[V]) Stats() Stats {
 		stats.IndexSize = int64(count * 64) // Rough estimate
 	}
 
-	// Count the number of segment files from the file cache plus the active file
-	c.fileCacheMutex.RLock()
-	stats.Segments = int64(len(c.fileCache))
-	c.fileCacheMutex.RUnlock()
+	// Count the number of segments from in-memory tracking
+	c.segmentsMutex.RLock()
+	stats.Segments = int64(len(c.segments))
+	c.segmentsMutex.RUnlock()
 
 	// Add 1 for the active file if it exists
 	if c.activeFile != nil {
@@ -478,59 +699,147 @@ func (c *DiskCache[V]) Stats() Stats {
 	return stats
 }
 
-// Scan iterates through all keys with the given prefix and calls the function for each key
-// The function should return true to stop iteration, false to continue
-func (c *DiskCache[V]) Scan(prefix []byte, fn func(key []byte) bool) error {
+// Scan iterates through all entries in physical storage order (by segment, then offset within each segment).
+// The callback receives each key-value pair and should return true to stop iteration, false to continue.
+// Deleted entries are included with a zero value (nil for pointers/slices). Corrupted records are skipped.
+// Note: Duplicates are expected when keys appear in multiple segments.
+func (c *DiskCache[V]) Scan(fn func(key []byte, value V) bool) error {
+	if c.isClosed() {
+		return ErrCacheClosed
+	}
+
+	// Get active segment info first
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	activeID := c.activeFileID
+	hasActive := c.activeFile != nil
+	c.mu.RUnlock()
 
-	tree := c.keydir.Load()
-	if tree == nil {
-		return nil
+	// Get all rotated segments sorted by generation and level
+	c.segmentsMutex.RLock()
+	segmentIDs := make([]segmentID, 0, len(c.segments))
+	for id := range c.segments {
+		segmentIDs = append(segmentIDs, id)
 	}
+	c.segmentsMutex.RUnlock()
 
-	prefixStr := string(prefix)
-
-	// If no prefix, iterate all keys
-	if len(prefix) == 0 {
-		var stop bool
-		tree.Scan(func(k string, v *keyEntry) bool {
-			// Skip deleted entries
-			if v.deleted {
-				return true // continue iteration
-			}
-			stop = fn([]byte(k))
-			return !stop // return false to stop iteration
-		})
-		return nil
-	}
-
-	// Use prefix-based iteration
-	var stop bool
-	tree.Scan(func(k string, v *keyEntry) bool {
-		// Check if key has the prefix
-		if !strings.HasPrefix(k, prefixStr) {
-			// If we've moved past the prefix range, stop
-			if k > prefixStr {
-				return false
-			}
-			return true // continue looking
+	// Sort segments by generation (oldest first), then by level
+	sort.Slice(segmentIDs, func(i, j int) bool {
+		if segmentIDs[i].generation != segmentIDs[j].generation {
+			return segmentIDs[i].generation < segmentIDs[j].generation
 		}
-
-		// Skip deleted entries
-		if v.deleted {
-			return true // continue iteration
-		}
-
-		stop = fn([]byte(k))
-		return !stop // return false to stop iteration
+		return segmentIDs[i].level < segmentIDs[j].level
 	})
+
+	// Scan rotated segments first
+	for _, segID := range segmentIDs {
+		stopped, err := c.scanSegmentPhysical(segID, fn)
+		if err != nil {
+			// Log error but continue with next segment
+			continue
+		}
+		if stopped {
+			return nil // User requested stop
+		}
+	}
+
+	// Finally scan the active segment (most recent data)
+	// We need to flush it first to ensure data is on disk
+	if hasActive {
+		c.mu.Lock()
+		if c.activeWriter != nil {
+			c.activeWriter.Flush()
+		}
+		c.mu.Unlock()
+
+		activeSegID := segmentID{generation: activeID, level: 0}
+		stopped, _ := c.scanSegmentPhysical(activeSegID, fn)
+		if stopped {
+			return nil
+		}
+	}
 
 	return nil
 }
 
+// scanSegmentPhysical scans a single segment file in physical order
+// Returns (stopped, error) where stopped indicates if the user callback requested stop
+func (c *DiskCache[V]) scanSegmentPhysical(segID segmentID, fn func([]byte, V) bool) (bool, error) {
+	filename := filepath.Join(c.dir, segID.String())
+	file, err := os.Open(filename)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	// Read and validate header
+	_, err = c.readFileHeader(file)
+	if err != nil {
+		// Try scanning from beginning if header is invalid
+		if _, err := file.Seek(0, 0); err != nil {
+			return false, err
+		}
+	} else {
+		// Skip header to start reading data
+		if _, err := file.Seek(fileHeaderSize, 0); err != nil {
+			return false, err
+		}
+	}
+
+	// Use a large buffer for sequential reads
+	reader := bufio.NewReaderSize(file, 256*1024) // 256KB buffer
+
+	for {
+		logEntry, _, err := c.readLogEntry(reader)
+		if err == io.EOF {
+			break // End of segment
+		}
+		if err != nil {
+			// Skip corrupted entries and continue
+			continue
+		}
+
+		// Handle deleted entries - call callback with zero value
+		if logEntry.deleted {
+			key := logEntry.key
+			c.releaseLogEntry(logEntry)
+
+			var zero V // Zero value for the generic type (nil for pointers/slices)
+			if fn(key, zero) {
+				return true, nil // Stop requested
+			}
+			continue
+		}
+
+		// Unmarshal the value
+		key := logEntry.key
+		value, err := c.marshaler.Unmarshal(logEntry.value)
+		c.releaseLogEntry(logEntry)
+
+		if err != nil {
+			// Skip entries that fail to unmarshal
+			continue
+		}
+
+		// Call user callback - return all entries, including duplicates
+		if fn(key, value) {
+			return true, nil // Stop requested
+		}
+	}
+
+	return false, nil
+}
+
 // loadFromDisk loads existing data files and rebuilds the keydir
 func (c *DiskCache[V]) loadFromDisk() error {
+	// Clean up any temporary files from incomplete compactions
+	// These files are not recoverable and should be removed
+	tmpFiles, err := filepath.Glob(filepath.Join(c.dir, "*.tmp"))
+	if err == nil {
+		for _, tmpFile := range tmpFiles {
+			os.Remove(tmpFile) // Ignore errors, best effort cleanup
+		}
+	}
+
 	// Try to load from segment files with embedded hints first
 	if err := c.loadFromSegmentFiles(); err == nil {
 		return nil
@@ -601,6 +910,22 @@ func (c *DiskCache[V]) loadSegmentFile(filename string, fileID uint32) error {
 	}
 	defer file.Close()
 
+	// Get file size for segment tracking
+	stat, err := file.Stat()
+	if err != nil {
+		return err
+	}
+
+	// Parse segment ID from filename
+	segID, err := parseSegmentID(filename)
+	if err != nil {
+		// Fallback for legacy format
+		segID = segmentID{generation: fileID, level: 0}
+	}
+
+	// Register this segment in memory
+	c.registerSegment(segID, filename, stat.Size())
+
 	// Read file header to get hint offset
 	header, err := c.readFileHeader(file)
 	if err != nil {
@@ -610,7 +935,8 @@ func (c *DiskCache[V]) loadSegmentFile(filename string, fileID uint32) error {
 			return fmt.Errorf("failed to seek after header error: %w", err)
 		}
 		// Try scanning from offset 0 (no header)
-		if err := c.scanSegmentFile(file, fileID); err != nil {
+		file.Close() // Close before calling scanSegmentFile which may truncate
+		if err := c.scanSegmentFile(filename, fileID); err != nil {
 			return fmt.Errorf("failed to scan segment file with corrupted header: %w", err)
 		}
 		return nil
@@ -621,13 +947,15 @@ func (c *DiskCache[V]) loadSegmentFile(filename string, fileID uint32) error {
 		if err := c.loadHintsFromSegment(file, header.hintOffset, fileID); err != nil {
 			// Hints failed, fall back to scanning the data section
 			fmt.Printf("Warning: hints corrupted in segment %d, falling back to full scan\n", fileID)
-			if err := c.scanSegmentFile(file, fileID); err != nil {
+			file.Close() // Close before calling scanSegmentFile which may truncate
+			if err := c.scanSegmentFile(filename, fileID); err != nil {
 				return fmt.Errorf("failed to scan segment file after hint failure: %w", err)
 			}
 		}
 	} else {
 		// No hints available, scan the file
-		if err := c.scanSegmentFile(file, fileID); err != nil {
+		file.Close() // Close before calling scanSegmentFile which may truncate
+		if err := c.scanSegmentFile(filename, fileID); err != nil {
 			return fmt.Errorf("failed to scan segment file: %w", err)
 		}
 	}
@@ -784,7 +1112,13 @@ func (c *DiskCache[V]) loadHintsFromSegment(file *os.File, hintOffset int64, fil
 }
 
 // scanSegmentFile scans a segment file to build the keydir (fallback when no hints)
-func (c *DiskCache[V]) scanSegmentFile(file *os.File, fileID uint32) error {
+func (c *DiskCache[V]) scanSegmentFile(filename string, fileID uint32) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
 	// Start after the file header
 	if _, err := file.Seek(fileHeaderSize, 0); err != nil {
 		return err
@@ -793,6 +1127,9 @@ func (c *DiskCache[V]) scanSegmentFile(file *os.File, fileID uint32) error {
 	reader := bufio.NewReader(file)
 	offset := int64(fileHeaderSize)
 	skippedRecords := 0
+	lastValidOffset := int64(fileHeaderSize) // Track last known good position
+	shouldTruncate := false
+	truncateOffset := int64(0)
 
 	for {
 		entry, entrySize, err := c.readLogEntry(reader)
@@ -800,21 +1137,12 @@ func (c *DiskCache[V]) scanSegmentFile(file *os.File, fileID uint32) error {
 			break
 		}
 		if err != nil {
-			// Handle corrupted records - skip and try to continue
+			fmt.Printf("Warning: failed to read log entry for segment %d at offset %d: %s\n", fileID, offset, err)
+			// Immediately truncate at first corruption - don't try to recover more records
 			skippedRecords++
-
-			// Try to skip ahead and find next valid record
-			// Read byte by byte looking for potentially valid record headers
-			if tryOffset := c.tryFindNextRecord(file, offset); tryOffset > offset {
-				offset = tryOffset
-				if _, err := file.Seek(offset, 0); err != nil {
-					break // Can't seek, stop processing
-				}
-				reader = bufio.NewReader(file)
-				continue
-			}
-
-			// Can't find next valid record, stop processing this segment
+			shouldTruncate = true
+			truncateOffset = lastValidOffset
+			fmt.Printf("Warning: corruption detected in segment %d, will truncate from offset %d\n", fileID, lastValidOffset)
 			break
 		}
 
@@ -843,90 +1171,44 @@ func (c *DiskCache[V]) scanSegmentFile(file *os.File, fileID uint32) error {
 		}
 		atomic.AddInt64(&c.stats.DataSize, int64(entrySize))
 
+		// Release entry back to pool
+		c.releaseLogEntry(entry)
+
 		offset += int64(entrySize)
+		lastValidOffset = offset // Update last valid position after successful read
 	}
 
 	if skippedRecords > 0 {
 		fmt.Printf("Warning: skipped %d corrupted records in segment %d\n", skippedRecords, fileID)
 	}
 
+	// Close file before truncating
+	file.Close()
+
+	// Truncate file if corruption was detected and no more valid records found
+	if shouldTruncate {
+		// Remove file from cache first to ensure stale handles are cleared
+		if err := c.removeCachedFile(fileID); err != nil {
+			fmt.Printf("Warning: failed to remove cached file %d: %v\n", fileID, err)
+		}
+
+		originalSize, _ := os.Stat(filename)
+		var originalBytes int64
+		if originalSize != nil {
+			originalBytes = originalSize.Size()
+		}
+
+		if err := os.Truncate(filename, truncateOffset); err != nil {
+			fmt.Printf("Error: failed to truncate segment %d at offset %d: %v\n", fileID, truncateOffset, err)
+			return fmt.Errorf("failed to truncate corrupted segment: %w", err)
+		} else {
+			removedBytes := originalBytes - truncateOffset
+			fmt.Printf("Successfully truncated segment %d to offset %d (removed %d corrupted bytes)\n",
+				fileID, truncateOffset, removedBytes)
+		}
+	}
+
 	return nil
-}
-
-// tryFindNextRecord attempts to find the next valid record after a corruption point
-// Returns the offset of the next potential valid record, or the same offset if none found
-func (c *DiskCache[V]) tryFindNextRecord(file *os.File, currentOffset int64) int64 {
-	// Get file size to avoid reading beyond EOF
-	stat, err := file.Stat()
-	if err != nil {
-		return currentOffset
-	}
-	fileSize := stat.Size()
-
-	// Try to scan forward byte by byte initially, then in larger increments
-	maxScanDistance := int64(4096) // Scan up to 4KB ahead
-
-	// First pass: scan byte by byte for the first 256 bytes
-	for skip := int64(1); skip < 256 && currentOffset+skip < fileSize-headerSize; skip++ {
-		testOffset := currentOffset + skip
-
-		if valid := c.validateRecordAtOffset(file, testOffset, fileSize); valid {
-			return testOffset
-		}
-	}
-
-	// Second pass: scan in 16-byte increments for the rest
-	for skip := int64(256); skip < maxScanDistance && currentOffset+skip < fileSize-headerSize; skip += 16 {
-		testOffset := currentOffset + skip
-
-		if valid := c.validateRecordAtOffset(file, testOffset, fileSize); valid {
-			return testOffset
-		}
-	}
-
-	return currentOffset // No valid record found
-}
-
-// validateRecordAtOffset checks if there's a valid record at the given offset
-func (c *DiskCache[V]) validateRecordAtOffset(file *os.File, offset int64, fileSize int64) bool {
-	// Try to read a header at this position
-	if _, err := file.Seek(offset, 0); err != nil {
-		return false
-	}
-
-	header := make([]byte, headerSize)
-	if n, err := file.Read(header); err != nil || n != headerSize {
-		return false
-	}
-
-	// Parse header fields
-	keySize := binary.LittleEndian.Uint32(header[8:12])
-	valueSize := binary.LittleEndian.Uint32(header[12:16])
-
-	// Sanity check: reasonable sizes
-	// Key should be 1-65KB, value should be 0-100MB
-	if keySize == 0 || keySize > 65536 || valueSize > 100*1024*1024 {
-		return false
-	}
-
-	// Check if the entire record would fit in the file
-	recordSize := int64(headerSize) + int64(keySize) + int64(valueSize)
-	if offset+recordSize > fileSize {
-		return false
-	}
-
-	// Try to actually read and validate the entry with CRC
-	if _, err := file.Seek(offset, 0); err != nil {
-		return false
-	}
-
-	reader := bufio.NewReader(file)
-	if _, _, err := c.readLogEntry(reader); err == nil {
-		// Found a valid record with correct CRC!
-		return true
-	}
-
-	return false
 }
 
 // openLogFile opens the current log file for appending
@@ -1056,6 +1338,14 @@ func (c *DiskCache[V]) rotateLogFile() error {
 		if err := c.activeFile.Sync(); err != nil {
 			return err
 		}
+
+		// Get final file size and register the segment for tracking
+		finalStat, err := c.activeFile.Stat()
+		if err == nil {
+			oldSegID := segmentID{generation: oldFileID, level: 0}
+			oldPath := filepath.Join(c.dir, oldSegID.String())
+			c.registerSegment(oldSegID, oldPath, finalStat.Size())
+		}
 	}
 
 	// Close current file
@@ -1172,6 +1462,9 @@ func (c *DiskCache[V]) loadLogFile(filename string) error {
 		}
 		atomic.AddInt64(&c.stats.DataSize, int64(entrySize))
 
+		// Release entry back to pool
+		c.releaseLogEntry(entry)
+
 		offset += int64(entrySize)
 	}
 
@@ -1246,6 +1539,7 @@ func (c *DiskCache[V]) compactSegment(fileID uint32) error {
 
 		// Skip deleted entries
 		if entry.deleted {
+			c.releaseLogEntry(entry)
 			offset += int64(entrySize)
 			continue
 		}
@@ -1265,6 +1559,7 @@ func (c *DiskCache[V]) compactSegment(fileID uint32) error {
 			value, err := c.marshaler.Unmarshal(entry.value)
 			if err != nil {
 				// Skip corrupted entries
+				c.releaseLogEntry(entry)
 				offset += int64(entrySize)
 				continue
 			}
@@ -1274,9 +1569,13 @@ func (c *DiskCache[V]) compactSegment(fileID uint32) error {
 			c.compactionMutex.Lock()
 
 			if err != nil {
+				c.releaseLogEntry(entry)
 				return fmt.Errorf("failed to rewrite entry during compaction: %w", err)
 			}
 		}
+
+		// Release entry back to pool
+		c.releaseLogEntry(entry)
 
 		offset += int64(entrySize)
 	}
@@ -1303,8 +1602,8 @@ func (c *DiskCache[V]) readValueFromDisk(entry *keyEntry) ([]byte, error) {
 	}
 
 	// Lock the cached file for reading
-	cachedFile.mutex.RLock()
-	defer cachedFile.mutex.RUnlock()
+	cachedFile.mutex.Lock()
+	defer cachedFile.mutex.Unlock()
 
 	// Seek to the entry position
 	if _, err := cachedFile.file.Seek(entry.offset, 0); err != nil {
@@ -1321,10 +1620,17 @@ func (c *DiskCache[V]) readValueFromDisk(entry *keyEntry) ([]byte, error) {
 	}
 
 	if logEntry.deleted {
+		c.releaseLogEntry(logEntry)
 		return nil, ErrKeyNotFound
 	}
 
-	return logEntry.value, nil
+	// Make a copy of the value before releasing the entry back to the pool
+	valueCopy := make([]byte, len(logEntry.value))
+	copy(valueCopy, logEntry.value)
+
+	c.releaseLogEntry(logEntry)
+
+	return valueCopy, nil
 }
 
 // getCachedFile returns a cached file handle for the given file ID
@@ -1404,37 +1710,59 @@ func (c *DiskCache[V]) removeCachedFile(fileID uint32) error {
 
 // readLogEntry reads a complete log entry from a reader
 func (c *DiskCache[V]) readLogEntry(reader *bufio.Reader) (*logEntry, int, error) {
+	// Get header buffer from pool
+	headerPtr := c.headerPool.Get().(*[]byte)
+	header := *headerPtr
+	defer c.headerPool.Put(headerPtr)
+
 	// Read header
-	header := make([]byte, headerSize)
 	if _, err := io.ReadFull(reader, header); err != nil {
 		return nil, 0, err
 	}
 
-	entry := &logEntry{
-		crc:       binary.LittleEndian.Uint32(header[0:4]),
-		timestamp: binary.LittleEndian.Uint32(header[4:8]),
-		keySize:   binary.LittleEndian.Uint32(header[8:12]),
-		valueSize: binary.LittleEndian.Uint32(header[12:16]),
-		deleted:   header[16] == 1,
+	// Get entry from pool
+	entry := c.entryPool.Get().(*logEntry)
+	entry.crc = binary.LittleEndian.Uint32(header[0:4])
+	entry.timestamp = binary.LittleEndian.Uint32(header[4:8])
+	entry.keySize = binary.LittleEndian.Uint32(header[8:12])
+	entry.valueSize = binary.LittleEndian.Uint32(header[12:16])
+	entry.deleted = header[16] == 1
+
+	// Allocate or reuse key buffer
+	if cap(entry.key) < int(entry.keySize) {
+		entry.key = make([]byte, entry.keySize)
+	} else {
+		entry.key = entry.key[:entry.keySize]
 	}
 
 	// Read key
-	entry.key = make([]byte, entry.keySize)
 	if _, err := io.ReadFull(reader, entry.key); err != nil {
+		c.entryPool.Put(entry)
 		return nil, 0, err
 	}
 
 	// Read value (if not deleted)
 	if !entry.deleted && entry.valueSize > 0 {
-		entry.value = make([]byte, entry.valueSize)
+		// Allocate or reuse value buffer
+		if cap(entry.value) < int(entry.valueSize) {
+			entry.value = make([]byte, entry.valueSize)
+		} else {
+			entry.value = entry.value[:entry.valueSize]
+		}
+
 		if _, err := io.ReadFull(reader, entry.value); err != nil {
+			c.entryPool.Put(entry)
 			return nil, 0, err
 		}
+	} else {
+		// Clear value if not needed
+		entry.value = entry.value[:0]
 	}
 
 	// Verify CRC
 	expectedCRC := c.calculateCRC(entry)
 	if entry.crc != expectedCRC {
+		c.entryPool.Put(entry)
 		return nil, 0, fmt.Errorf("CRC mismatch: expected %d, got %d", expectedCRC, entry.crc)
 	}
 
@@ -1442,19 +1770,34 @@ func (c *DiskCache[V]) readLogEntry(reader *bufio.Reader) (*logEntry, int, error
 	return entry, entrySize, nil
 }
 
+// releaseLogEntry returns a log entry to the pool for reuse
+func (c *DiskCache[V]) releaseLogEntry(entry *logEntry) {
+	if entry != nil {
+		c.entryPool.Put(entry)
+	}
+}
+
 // calculateCRC calculates the CRC32 checksum for a log entry
 func (c *DiskCache[V]) calculateCRC(entry *logEntry) uint32 {
 	crc := crc32.NewIEEE()
 
-	// Include timestamp, key size, value size, and deleted flag
-	binary.Write(crc, binary.LittleEndian, entry.timestamp)
-	binary.Write(crc, binary.LittleEndian, entry.keySize)
-	binary.Write(crc, binary.LittleEndian, entry.valueSize)
+	// Pre-allocate a small buffer for the header fields to avoid allocations
+	var buf [13]byte
+
+	// Include timestamp (4 bytes)
+	binary.LittleEndian.PutUint32(buf[0:4], entry.timestamp)
+	// Include key size (4 bytes)
+	binary.LittleEndian.PutUint32(buf[4:8], entry.keySize)
+	// Include value size (4 bytes)
+	binary.LittleEndian.PutUint32(buf[8:12], entry.valueSize)
+	// Include deleted flag (1 byte)
 	if entry.deleted {
-		crc.Write([]byte{1})
+		buf[12] = 1
 	} else {
-		crc.Write([]byte{0})
+		buf[12] = 0
 	}
+
+	crc.Write(buf[:])
 
 	// Include key and value
 	crc.Write(entry.key)
@@ -1649,7 +1992,15 @@ func (c *DiskCache[V]) compactLevelLSMLocked(sourceLevel uint8, batchSize int, b
 
 		if err := os.Remove(seg.path); err == nil {
 			result.DeletedSegments = append(result.DeletedSegments, filepath.Base(seg.path))
+			// Unregister from in-memory tracking
+			c.unregisterSegment(seg.id)
 		}
+	}
+
+	// Register the new output segment
+	outputPath := filepath.Join(c.dir, outputID.String())
+	if stat, err := os.Stat(outputPath); err == nil {
+		c.registerSegment(outputID, outputPath, stat.Size())
 	}
 
 	return result, nil
@@ -1701,7 +2052,15 @@ func (c *DiskCache[V]) compactLevel4Locked(segments []*segmentInfo) (*Compaction
 		c.removeCachedFile(seg.id.generation)
 		if err := os.Remove(seg.path); err == nil {
 			result.DeletedSegments = append(result.DeletedSegments, filepath.Base(seg.path))
+			// Unregister from in-memory tracking
+			c.unregisterSegment(seg.id)
 		}
+	}
+
+	// Register the new output segment
+	outputPath := filepath.Join(c.dir, outputID.String())
+	if stat, err := os.Stat(outputPath); err == nil {
+		c.registerSegment(outputID, outputPath, stat.Size())
 	}
 
 	return result, nil
