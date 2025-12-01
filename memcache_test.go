@@ -649,6 +649,10 @@ func (m *mockCache) Get(key []byte) ([]byte, error) {
 	return nil, ErrKeyNotFound
 }
 
+func (m *mockCache) GetInto(key []byte, target *[]byte) error {
+	return ErrKeyNotFound
+}
+
 func (m *mockCache) Set(key []byte, value []byte) error {
 	return nil // No-op
 }
@@ -668,7 +672,7 @@ func (m *mockCache) Has(key []byte) bool {
 	return false
 }
 
-func (m *mockCache) Scan(fn func(key []byte, value []byte) bool) error {
+func (m *mockCache) Scan(fn func(key []byte, value *[]byte) bool) error {
 	return nil
 }
 

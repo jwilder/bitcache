@@ -15,14 +15,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/edsrzf/mmap-go"
 	"github.com/tidwall/btree"
 )
 
-// cachedFile represents a cached file handle with its reader and mutex
+// cachedFile represents a memory-mapped cached file
 type cachedFile struct {
-	file   *os.File
-	reader *bufio.Reader
-	mutex  sync.RWMutex
+	file  *os.File
+	mmap  mmap.MMap
+	mutex sync.RWMutex
 }
 
 // DiskCache provides a simple embedded key/value store inspired by the Bitcask design.
@@ -74,8 +75,9 @@ type DiskCache[V any] struct {
 	// Auto-compaction
 	autoCompactDone chan struct{} // Signals auto-compaction goroutine to stop
 	// Buffer pools for reducing allocations
-	headerPool *sync.Pool
-	entryPool  *sync.Pool
+	headerPool     *sync.Pool
+	entryPool      *sync.Pool
+	marshalBufPool *BufferPool // Pool for marshal operations
 	// Configuration
 	maxSegmentSize      int64
 	autoCompactEnabled  bool
@@ -188,6 +190,7 @@ func NewDiskCacheWithConfig[V any](dir string, config DiskCacheConfig, marshaler
 				return &logEntry{}
 			},
 		},
+		marshalBufPool: NewBufferPool(32 * 4096), // 4KB initial size for marshal buffers
 	}
 
 	// Initialize the keydir with an empty btree
@@ -276,12 +279,70 @@ func (c *DiskCache[V]) Get(key []byte) (V, error) {
 	}
 
 	// Unmarshal the bytes to the target type
-	value, err := c.marshaler.Unmarshal(data)
+	var value V
+	err = c.marshaler.Unmarshal(data, &value)
 	if err != nil {
 		return zero, fmt.Errorf("failed to unmarshal value: %w", err)
 	}
 
 	return value, nil
+}
+
+// GetInto retrieves the value for the given key into the provided target
+// This allows the caller to reuse/pool V objects to avoid allocations
+func (c *DiskCache[V]) GetInto(key []byte, target *V) error {
+	// Check closed status with minimal locking
+	if c.isClosed() {
+		return ErrCacheClosed
+	}
+
+	// Lock-free keydir read using atomic pointer
+	keyStr := string(key)
+	entry, exists := c.getKeyEntry(keyStr)
+	if !exists || entry.deleted {
+		return ErrKeyNotFound
+	}
+
+	// Check if we need to flush the active writer (only if reading from active file)
+	c.mu.RLock()
+	needsFlush := false
+	if entry.fileID == c.activeFileID && c.activeWriter != nil {
+		entryEnd := entry.offset + int64(entry.size)
+		bufferedBytes := int64(c.activeWriter.Buffered())
+
+		if entryEnd > c.activeOffset-bufferedBytes {
+			needsFlush = true
+		}
+	}
+	c.mu.RUnlock()
+
+	// Upgrade to write lock if we need to flush
+	if needsFlush {
+		c.mu.Lock()
+		if c.activeWriter != nil {
+			if err := c.activeWriter.Flush(); err != nil {
+				c.mu.Unlock()
+				return fmt.Errorf("failed to flush active writer: %w", err)
+			}
+		}
+		c.mu.Unlock()
+	}
+
+	// Final closed check before disk I/O
+	if c.isClosed() {
+		return ErrCacheClosed
+	}
+
+	atomic.AddInt64(&c.stats.Reads, 1)
+
+	// Read the value from disk
+	data, err := c.readValueFromDisk(entry)
+	if err != nil {
+		return fmt.Errorf("failed to read value: %w", err)
+	}
+
+	// Unmarshal directly into the caller's target
+	return c.marshaler.Unmarshal(data, target)
 }
 
 // Set stores a key-value pair in the cache
@@ -291,8 +352,12 @@ func (c *DiskCache[V]) Set(key []byte, value V) error {
 		return ErrCacheClosed
 	}
 
-	// Marshal the value to bytes
-	data, err := c.marshaler.Marshal(value)
+	// Get a buffer from the pool for marshaling
+	buf := c.marshalBufPool.Get()
+	defer c.marshalBufPool.Put(buf)
+
+	// Marshal the value to bytes using the pooled buffer
+	data, err := c.marshaler.Marshal(value, buf)
 	if err != nil {
 		return fmt.Errorf("failed to marshal value: %w", err)
 	}
@@ -375,20 +440,28 @@ func (c *DiskCache[V]) BatchSet(entries []struct {
 	prepared := make([]preparedEntry, 0, len(entries))
 	timestamp := uint32(time.Now().Unix())
 
+	// Get a buffer from the pool for marshaling (reused across all entries)
+	buf := c.marshalBufPool.Get()
+	defer c.marshalBufPool.Put(buf)
+
 	for _, entry := range entries {
-		// Marshal the value to bytes
-		data, err := c.marshaler.Marshal(entry.Value)
+		// Marshal the value to bytes using the pooled buffer
+		data, err := c.marshaler.Marshal(entry.Value, buf)
 		if err != nil {
 			return fmt.Errorf("failed to marshal value: %w", err)
 		}
+
+		// Make a copy of marshaled data since we're reusing the buffer
+		dataCopy := make([]byte, len(data))
+		copy(dataCopy, data)
 
 		// Prepare log entry and calculate CRC
 		logEnt := &logEntry{
 			timestamp: timestamp,
 			keySize:   uint32(len(entry.Key)),
-			valueSize: uint32(len(data)),
+			valueSize: uint32(len(dataCopy)),
 			key:       entry.Key,
-			value:     data,
+			value:     dataCopy,
 			deleted:   false,
 		}
 		logEnt.crc = c.calculateCRC(logEnt)
@@ -587,10 +660,13 @@ func (c *DiskCache[V]) Close() error {
 		}
 	}
 
-	// Close all cached files
+	// Close all cached files and unmap them
 	c.fileCacheMutex.Lock()
 	for fileID, cached := range c.fileCache {
 		cached.mutex.Lock()
+		if cached.mmap != nil {
+			cached.mmap.Unmap()
+		}
 		cached.file.Close()
 		cached.mutex.Unlock()
 		delete(c.fileCache, fileID)
@@ -703,7 +779,7 @@ func (c *DiskCache[V]) Stats() Stats {
 // The callback receives each key-value pair and should return true to stop iteration, false to continue.
 // Deleted entries are included with a zero value (nil for pointers/slices). Corrupted records are skipped.
 // Note: Duplicates are expected when keys appear in multiple segments.
-func (c *DiskCache[V]) Scan(fn func(key []byte, value V) bool) error {
+func (c *DiskCache[V]) Scan(fn func(key []byte, value *V) bool) error {
 	if c.isClosed() {
 		return ErrCacheClosed
 	}
@@ -763,7 +839,120 @@ func (c *DiskCache[V]) Scan(fn func(key []byte, value V) bool) error {
 
 // scanSegmentPhysical scans a single segment file in physical order
 // Returns (stopped, error) where stopped indicates if the user callback requested stop
-func (c *DiskCache[V]) scanSegmentPhysical(segID segmentID, fn func([]byte, V) bool) (bool, error) {
+func (c *DiskCache[V]) scanSegmentPhysical(segID segmentID, fn func([]byte, *V) bool) (bool, error) {
+	// Check if this is the active segment
+	c.mu.RLock()
+	isActive := segID.generation == c.activeFileID
+	c.mu.RUnlock()
+
+	// For active segment, use traditional buffered I/O
+	// For inactive segments, try to use mmap for better performance
+	if isActive {
+		return c.scanSegmentWithBufferedIO(segID, fn)
+	}
+
+	// Try to use mmap for inactive segments
+	cachedFile, err := c.getCachedFile(segID.generation)
+	if err != nil {
+		// Fall back to buffered I/O if mmap fails
+		return c.scanSegmentWithBufferedIO(segID, fn)
+	}
+
+	// Scan using mmap
+	cachedFile.mutex.RLock()
+	defer cachedFile.mutex.RUnlock()
+
+	data := cachedFile.mmap
+	offset := int64(0)
+
+	// Skip file header if present
+	if len(data) >= fileHeaderSize {
+		offset = fileHeaderSize
+	}
+
+	for offset < int64(len(data)) {
+		// Check if we have enough data for header
+		if offset+headerSize > int64(len(data)) {
+			break // End of file
+		}
+
+		// Parse header directly from mmap
+		headerData := data[offset : offset+headerSize]
+		crc := binary.LittleEndian.Uint32(headerData[0:4])
+		timestamp := binary.LittleEndian.Uint32(headerData[4:8])
+		keySize := binary.LittleEndian.Uint32(headerData[8:12])
+		valueSize := binary.LittleEndian.Uint32(headerData[12:16])
+		deleted := headerData[16] == 1
+
+		entrySize := int64(headerSize + keySize + valueSize)
+		if offset+entrySize > int64(len(data)) {
+			break // Incomplete entry at end of file
+		}
+
+		entryData := data[offset : offset+entrySize]
+		keyData := entryData[headerSize : headerSize+keySize]
+		valueData := entryData[headerSize+keySize : headerSize+keySize+valueSize]
+
+		// Verify CRC
+		logEntry := &logEntry{
+			timestamp: timestamp,
+			keySize:   keySize,
+			valueSize: valueSize,
+			key:       keyData,
+			value:     valueData,
+			deleted:   deleted,
+		}
+		expectedCRC := c.calculateCRC(logEntry)
+		if crc != expectedCRC {
+			// Skip corrupted entry
+			offset += entrySize
+			continue
+		}
+
+		// Handle deleted entries
+		if deleted {
+			// Make a copy of the key since we're returning it outside mmap
+			keyCopy := make([]byte, len(keyData))
+			copy(keyCopy, keyData)
+
+			// Pass nil pointer for deleted entries
+			if fn(keyCopy, nil) {
+				return true, nil // Stop requested
+			}
+			offset += entrySize
+			continue
+		}
+
+		// Make copies before unmarshaling (data will escape mmap scope)
+		valueCopy := make([]byte, len(valueData))
+		copy(valueCopy, valueData)
+
+		// Unmarshal the value into a new V
+		var value V
+		err = c.marshaler.Unmarshal(valueCopy, &value)
+		if err != nil {
+			// Skip entries that fail to unmarshal
+			offset += entrySize
+			continue
+		}
+
+		// Make a copy of the key
+		keyCopy := make([]byte, len(keyData))
+		copy(keyCopy, keyData)
+
+		// Call user callback
+		if fn(keyCopy, &value) {
+			return true, nil // Stop requested
+		}
+
+		offset += entrySize
+	}
+
+	return false, nil
+}
+
+// scanSegmentWithBufferedIO scans a segment using traditional buffered I/O
+func (c *DiskCache[V]) scanSegmentWithBufferedIO(segID segmentID, fn func([]byte, *V) bool) (bool, error) {
 	filename := filepath.Join(c.dir, segID.String())
 	file, err := os.Open(filename)
 	if err != nil {
@@ -798,13 +987,13 @@ func (c *DiskCache[V]) scanSegmentPhysical(segID segmentID, fn func([]byte, V) b
 			continue
 		}
 
-		// Handle deleted entries - call callback with zero value
+		// Handle deleted entries - call callback with nil pointer
 		if logEntry.deleted {
 			key := logEntry.key
 			c.releaseLogEntry(logEntry)
 
-			var zero V // Zero value for the generic type (nil for pointers/slices)
-			if fn(key, zero) {
+			// Pass nil pointer for deleted entries
+			if fn(key, nil) {
 				return true, nil // Stop requested
 			}
 			continue
@@ -812,7 +1001,8 @@ func (c *DiskCache[V]) scanSegmentPhysical(segID segmentID, fn func([]byte, V) b
 
 		// Unmarshal the value
 		key := logEntry.key
-		value, err := c.marshaler.Unmarshal(logEntry.value)
+		var value V
+		err = c.marshaler.Unmarshal(logEntry.value, &value)
 		c.releaseLogEntry(logEntry)
 
 		if err != nil {
@@ -821,7 +1011,7 @@ func (c *DiskCache[V]) scanSegmentPhysical(segID segmentID, fn func([]byte, V) b
 		}
 
 		// Call user callback - return all entries, including duplicates
-		if fn(key, value) {
+		if fn(key, &value) {
 			return true, nil // Stop requested
 		}
 	}
@@ -1556,7 +1746,8 @@ func (c *DiskCache[V]) compactSegment(fileID uint32) error {
 			// This is the latest version, unmarshal then write it to the active file
 			// We need to unlock the compaction mutex temporarily to avoid deadlock
 			// since Set also needs to take the write lock
-			value, err := c.marshaler.Unmarshal(entry.value)
+			var value V
+			err = c.marshaler.Unmarshal(entry.value, &value)
 			if err != nil {
 				// Skip corrupted entries
 				c.releaseLogEntry(entry)
@@ -1594,46 +1785,153 @@ func (c *DiskCache[V]) compactSegment(fileID uint32) error {
 	return nil
 }
 
-// readValueFromDisk reads a value from disk given a key entry using cached file handles
+// readValueFromDisk reads a value from disk given a key entry using memory-mapped files
 func (c *DiskCache[V]) readValueFromDisk(entry *keyEntry) ([]byte, error) {
+	// Check if this is the active file - if so, use regular file I/O instead of mmap
+	c.mu.RLock()
+	isActiveFile := entry.fileID == c.activeFileID
+	c.mu.RUnlock()
+
+	if isActiveFile {
+		// For active file, use traditional file I/O with seeking
+		return c.readValueFromActiveFile(entry)
+	}
+
+	// For inactive files, use mmap
 	cachedFile, err := c.getCachedFile(entry.fileID)
 	if err != nil {
 		return nil, err
 	}
 
 	// Lock the cached file for reading
-	cachedFile.mutex.Lock()
-	defer cachedFile.mutex.Unlock()
+	cachedFile.mutex.RLock()
+	defer cachedFile.mutex.RUnlock()
 
-	// Seek to the entry position
-	if _, err := cachedFile.file.Seek(entry.offset, 0); err != nil {
-		return nil, err
+	// Check if the offset is valid
+	if entry.offset < 0 || int(entry.offset)+int(entry.size) > len(cachedFile.mmap) {
+		return nil, fmt.Errorf("invalid offset %d or size %d for mmap of length %d", entry.offset, entry.size, len(cachedFile.mmap))
 	}
 
-	// Create a new buffered reader for this read operation to avoid race conditions
-	// with shared reader state
-	reader := bufio.NewReader(cachedFile.file)
+	// Read directly from memory-mapped region
+	data := cachedFile.mmap[entry.offset : entry.offset+int64(entry.size)]
 
-	logEntry, _, err := c.readLogEntry(reader)
-	if err != nil {
-		return nil, err
+	// Parse the log entry header from the mmap'd data
+	if len(data) < headerSize {
+		return nil, fmt.Errorf("insufficient data for header")
 	}
 
-	if logEntry.deleted {
-		c.releaseLogEntry(logEntry)
+	crc := binary.LittleEndian.Uint32(data[0:4])
+	timestamp := binary.LittleEndian.Uint32(data[4:8])
+	keySize := binary.LittleEndian.Uint32(data[8:12])
+	valueSize := binary.LittleEndian.Uint32(data[12:16])
+	deleted := data[16] == 1
+
+	if deleted {
 		return nil, ErrKeyNotFound
 	}
 
-	// Make a copy of the value before releasing the entry back to the pool
-	valueCopy := make([]byte, len(logEntry.value))
-	copy(valueCopy, logEntry.value)
+	// Verify we have enough data
+	expectedSize := headerSize + int(keySize) + int(valueSize)
+	if len(data) < expectedSize {
+		return nil, fmt.Errorf("insufficient data: expected %d, got %d", expectedSize, len(data))
+	}
 
-	c.releaseLogEntry(logEntry)
+	// Extract value from mmap (skip header and key)
+	valueStart := headerSize + int(keySize)
+	valueEnd := valueStart + int(valueSize)
+	value := data[valueStart:valueEnd]
+
+	// Verify CRC
+	logEntry := &logEntry{
+		timestamp: timestamp,
+		keySize:   keySize,
+		valueSize: valueSize,
+		key:       data[headerSize : headerSize+keySize],
+		value:     value,
+		deleted:   deleted,
+	}
+	expectedCRC := c.calculateCRC(logEntry)
+	if crc != expectedCRC {
+		return nil, fmt.Errorf("CRC mismatch: expected %d, got %d", expectedCRC, crc)
+	}
+
+	// Make a copy of the value since we're returning it outside the mmap
+	valueCopy := make([]byte, len(value))
+	copy(valueCopy, value)
 
 	return valueCopy, nil
 }
 
-// getCachedFile returns a cached file handle for the given file ID
+// readValueFromActiveFile reads a value from the active file using traditional file I/O
+func (c *DiskCache[V]) readValueFromActiveFile(entry *keyEntry) ([]byte, error) {
+	c.mu.RLock()
+	file := c.activeFile
+	c.mu.RUnlock()
+
+	if file == nil {
+		return nil, fmt.Errorf("active file is nil")
+	}
+
+	// Create a temporary read buffer
+	buf := make([]byte, entry.size)
+
+	// Read from file at the specified offset
+	n, err := file.ReadAt(buf, entry.offset)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("failed to read from active file: %w", err)
+	}
+	if n < int(entry.size) {
+		return nil, fmt.Errorf("short read from active file: expected %d, got %d", entry.size, n)
+	}
+
+	// Parse the log entry header
+	if len(buf) < headerSize {
+		return nil, fmt.Errorf("insufficient data for header")
+	}
+
+	crc := binary.LittleEndian.Uint32(buf[0:4])
+	timestamp := binary.LittleEndian.Uint32(buf[4:8])
+	keySize := binary.LittleEndian.Uint32(buf[8:12])
+	valueSize := binary.LittleEndian.Uint32(buf[12:16])
+	deleted := buf[16] == 1
+
+	if deleted {
+		return nil, ErrKeyNotFound
+	}
+
+	// Verify we have enough data
+	expectedSize := headerSize + int(keySize) + int(valueSize)
+	if len(buf) < expectedSize {
+		return nil, fmt.Errorf("insufficient data: expected %d, got %d", expectedSize, len(buf))
+	}
+
+	// Extract value (skip header and key)
+	valueStart := headerSize + int(keySize)
+	valueEnd := valueStart + int(valueSize)
+	value := buf[valueStart:valueEnd]
+
+	// Verify CRC
+	logEntry := &logEntry{
+		timestamp: timestamp,
+		keySize:   keySize,
+		valueSize: valueSize,
+		key:       buf[headerSize : headerSize+keySize],
+		value:     value,
+		deleted:   deleted,
+	}
+	expectedCRC := c.calculateCRC(logEntry)
+	if crc != expectedCRC {
+		return nil, fmt.Errorf("CRC mismatch: expected %d, got %d", expectedCRC, crc)
+	}
+
+	// Make a copy of the value
+	valueCopy := make([]byte, len(value))
+	copy(valueCopy, value)
+
+	return valueCopy, nil
+}
+
+// getCachedFile returns a memory-mapped cached file for the given file ID
 func (c *DiskCache[V]) getCachedFile(fileID uint32) (*cachedFile, error) {
 	c.fileCacheMutex.RLock()
 	cached, exists := c.fileCache[fileID]
@@ -1643,7 +1941,7 @@ func (c *DiskCache[V]) getCachedFile(fileID uint32) (*cachedFile, error) {
 		return cached, nil
 	}
 
-	// File not in cache, need to open it
+	// File not in cache, need to open and mmap it
 	c.fileCacheMutex.Lock()
 	defer c.fileCacheMutex.Unlock()
 
@@ -1675,17 +1973,24 @@ func (c *DiskCache[V]) getCachedFile(fileID uint32) (*cachedFile, error) {
 		}
 	}
 
+	// Memory-map the file for fast reads
+	mmapData, err := mmap.Map(file, mmap.RDONLY, 0)
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to mmap file %s: %w", filename, err)
+	}
+
 	cached = &cachedFile{
-		file:   file,
-		reader: bufio.NewReader(file),
-		mutex:  sync.RWMutex{},
+		file:  file,
+		mmap:  mmapData,
+		mutex: sync.RWMutex{},
 	}
 
 	c.fileCache[fileID] = cached
 	return cached, nil
 }
 
-// removeCachedFile removes a file from the cache and closes it
+// removeCachedFile removes a file from the cache, unmaps it, and closes it
 func (c *DiskCache[V]) removeCachedFile(fileID uint32) error {
 	c.fileCacheMutex.Lock()
 	defer c.fileCacheMutex.Unlock()
@@ -1699,13 +2004,23 @@ func (c *DiskCache[V]) removeCachedFile(fileID uint32) error {
 	cached.mutex.Lock()
 	defer cached.mutex.Unlock()
 
+	// Unmap the memory-mapped region
+	var mmapErr error
+	if cached.mmap != nil {
+		mmapErr = cached.mmap.Unmap()
+	}
+
 	// Close the file
-	err := cached.file.Close()
+	fileErr := cached.file.Close()
 
 	// Remove from cache
 	delete(c.fileCache, fileID)
 
-	return err
+	// Return first error encountered
+	if mmapErr != nil {
+		return mmapErr
+	}
+	return fileErr
 }
 
 // readLogEntry reads a complete log entry from a reader

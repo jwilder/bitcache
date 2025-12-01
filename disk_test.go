@@ -1728,7 +1728,7 @@ func TestDiskCache_Scan_OrderedKeys(t *testing.T) {
 
 	// Scan all keys and verify they're in write order
 	var scannedKeys []string
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		scannedKeys = append(scannedKeys, string(key))
 		return false
 	})
@@ -1787,7 +1787,7 @@ func TestDiskCache_Scan_PrefixOrderedKeys(t *testing.T) {
 
 	// Scan all keys - returns in physical write order
 	var allKeys []string
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		allKeys = append(allKeys, string(key))
 		return false
 	})
@@ -1851,7 +1851,7 @@ func TestDiskCache_Scan_OrderWithDeletes(t *testing.T) {
 	// Scan and verify order - returns all entries in write order (including delete tombstones)
 	var scannedKeys []string
 	var deletedCount int
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		scannedKeys = append(scannedKeys, string(key))
 		if value == nil {
 			deletedCount++
@@ -1925,7 +1925,7 @@ func TestDiskCache_Scan_EarlyTermination(t *testing.T) {
 
 	// Scan and stop after 10 keys
 	var scannedKeys []string
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		scannedKeys = append(scannedKeys, string(key))
 		return len(scannedKeys) >= 10
 	})
@@ -1970,7 +1970,7 @@ func TestDiskCache_Scan_LargeDataset(t *testing.T) {
 
 	// Scan all keys
 	var scannedKeys []string
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		scannedKeys = append(scannedKeys, string(key))
 		return false
 	})
@@ -2185,9 +2185,9 @@ func TestDiskCache_Scan_WithValues(t *testing.T) {
 
 	// Scan all keys and verify values match
 	scannedCount := 0
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		keyStr := string(key)
-		valueStr := string(value)
+		valueStr := string(*value)
 
 		expectedValue, exists := testData[keyStr]
 		if !exists {
@@ -2247,9 +2247,9 @@ func TestDiskCache_Scan_PrefixWithValues(t *testing.T) {
 	// Scan all entries and count by prefix
 	userCount := 0
 	configCount := 0
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		keyStr := string(key)
-		valueStr := string(value)
+		valueStr := string(*value)
 
 		expectedValue, exists := testData[keyStr]
 		if !exists {
@@ -2328,9 +2328,9 @@ func TestMemCache_Scan_WithValues(t *testing.T) {
 
 	// Scan and verify values
 	scannedCount := 0
-	err = memCache.Scan(func(key []byte, value []byte) bool {
+	err = memCache.Scan(func(key []byte, value *[]byte) bool {
 		keyStr := string(key)
-		valueStr := string(value)
+		valueStr := string(*value)
 
 		expectedValue, exists := testData[keyStr]
 		if !exists {
@@ -2425,8 +2425,8 @@ func TestDiskCache_Scan_SkipsCorruptedRecords(t *testing.T) {
 
 	// Now scan - it should skip the corrupted record and continue
 	scannedKeys := make(map[string]string)
-	err = cache.Scan(func(key []byte, value []byte) bool {
-		scannedKeys[string(key)] = string(value)
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
+		scannedKeys[string(key)] = string(*value)
 		return false // continue
 	})
 
@@ -2510,7 +2510,7 @@ func TestDiskCache_Scan_AllCorrupted(t *testing.T) {
 
 	// Scan should succeed but return no keys
 	scannedCount := 0
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		scannedCount++
 		return false
 	})
@@ -2592,7 +2592,7 @@ func TestDiskCache_Scan_PartiallyCorrupted(t *testing.T) {
 
 	// Scan and collect keys
 	scannedKeys := make(map[string]bool)
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		scannedKeys[string(key)] = true
 		return false
 	})
@@ -2650,15 +2650,21 @@ func TestScanIncludesDeletedEntries(t *testing.T) {
 		deleted bool
 	}
 
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
+		var val []byte
+		deleted := value == nil
+		if !deleted {
+			val = *value
+			deleted = val == nil
+		}
 		entry := struct {
 			key     string
 			value   []byte
 			deleted bool
 		}{
 			key:     string(key),
-			value:   value,
-			deleted: value == nil,
+			value:   val,
+			deleted: deleted,
 		}
 		scannedEntries = append(scannedEntries, entry)
 		return false
@@ -2754,11 +2760,15 @@ func TestScanDeletedEntriesWithValues(t *testing.T) {
 		value []byte
 	}
 
-	err = cache.Scan(func(k []byte, v []byte) bool {
+	err = cache.Scan(func(k []byte, v *[]byte) bool {
+		var val []byte
+		if v != nil {
+			val = *v
+		}
 		entries = append(entries, struct {
 			key   string
 			value []byte
-		}{string(k), v})
+		}{string(k), val})
 		return false
 	})
 	if err != nil {
@@ -2820,8 +2830,8 @@ func TestDiskCache_Scan_Basic(t *testing.T) {
 
 	// Scan physically and verify we get all data
 	scanned := make(map[string]string)
-	err = cache.Scan(func(key []byte, value []byte) bool {
-		scanned[string(key)] = string(value)
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
+		scanned[string(key)] = string(*value)
 		return false // continue
 	})
 
@@ -2886,7 +2896,7 @@ func TestDiskCache_Scan_MultipleSegments(t *testing.T) {
 
 	// Scan physically
 	scannedKeys := make([]string, 0)
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		scannedKeys = append(scannedKeys, string(key))
 		return false
 	})
@@ -2928,7 +2938,7 @@ func TestDiskCache_Scan_EarlyStop(t *testing.T) {
 
 	// Scan and stop after 5 entries
 	count := 0
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		count++
 		return count >= 5 // stop after 5
 	})
@@ -2982,7 +2992,7 @@ func TestDiskCache_Scan_SkipsDeleted(t *testing.T) {
 
 	// Scan physically - returns all entries including duplicates
 	scannedKeys := make([]string, 0)
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		scannedKeys = append(scannedKeys, string(key))
 		return false
 	})
@@ -3051,8 +3061,8 @@ func TestDiskCache_Scan_SkipsSuperseded(t *testing.T) {
 
 	// Scan physically and collect values
 	scannedData := make(map[string]string)
-	err = cache.Scan(func(key []byte, value []byte) bool {
-		scannedData[string(key)] = string(value)
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
+		scannedData[string(key)] = string(*value)
 		return false
 	})
 
@@ -3115,7 +3125,7 @@ func TestDiskCache_Scan_Performance(t *testing.T) {
 	// In real usage, Scan should be faster for full scans
 
 	physicalCount := 0
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		physicalCount++
 		return false
 	})
@@ -3124,7 +3134,7 @@ func TestDiskCache_Scan_Performance(t *testing.T) {
 	}
 
 	regularCount := 0
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		regularCount++
 		return false
 	})
@@ -3692,7 +3702,7 @@ func TestDiskCache_TruncateCorruptedSegment(t *testing.T) {
 
 	// We should have at least some keys (the ones before corruption)
 	scannedCount := 0
-	err = cache.Scan(func(key []byte, value []byte) bool {
+	err = cache.Scan(func(key []byte, value *[]byte) bool {
 		scannedCount++
 		return false
 	})
@@ -3800,7 +3810,7 @@ func TestDiskCache_TruncateMiddleCorruption(t *testing.T) {
 
 	// Count recovered keys
 	count := 0
-	_ = cache.Scan(func(key []byte, value []byte) bool {
+	_ = cache.Scan(func(key []byte, value *[]byte) bool {
 		count++
 		return false
 	})
@@ -3884,7 +3894,7 @@ func TestDiskCache_NoTruncateOnValidFile(t *testing.T) {
 	// Note: Scan returns all entries from all segments, so duplicates are expected
 	count := 0
 	uniqueKeys := make(map[string]bool)
-	_ = cache.Scan(func(key []byte, value []byte) bool {
+	_ = cache.Scan(func(key []byte, value *[]byte) bool {
 		keyStr := string(key)
 		uniqueKeys[keyStr] = true
 		count++

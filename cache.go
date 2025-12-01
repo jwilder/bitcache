@@ -3,6 +3,7 @@ package bitcache
 import (
 	"encoding/json"
 	"errors"
+	"sync"
 )
 
 var (
@@ -13,19 +14,33 @@ var (
 )
 
 // Marshaler defines the interface for converting values to/from byte slices
-// This allows DiskCache to persist Go types in any serialization format
+// This allows DiskCache to persist Go types in any serialization format with minimal allocations
 type Marshaler[V any] interface {
-	// Marshal converts a value to bytes for storage
-	Marshal(value V) ([]byte, error)
-	// Unmarshal converts bytes back to a value
-	Unmarshal(data []byte) (V, error)
+	// Marshal encodes a value into the provided buffer
+	// Returns the slice of dst that contains the encoded data (may be a new slice if dst is too small)
+	// If dst has sufficient capacity, no allocation occurs
+	Marshal(value V, dst []byte) ([]byte, error)
+
+	// Unmarshal decodes data into the provided target
+	// The caller is responsible for allocating/pooling the target
+	Unmarshal(data []byte, target *V) error
+
+	// MarshalSize returns the maximum bytes needed to marshal value
+	// Returns -1 if size cannot be determined without marshaling
+	MarshalSize(value V) int
 }
 
 // Cache defines the interface for a persistent key-value cache with generic value types
 type Cache[V any] interface {
 	// Get retrieves the value for the given key
 	// Returns ErrKeyNotFound if the key doesn't exist
+	// Allocates a new V for the result
 	Get(key []byte) (V, error)
+
+	// GetInto retrieves the value for the given key into the provided target
+	// This allows the caller to reuse/pool V objects to avoid allocations
+	// Returns ErrKeyNotFound if the key doesn't exist
+	GetInto(key []byte, target *V) error
 
 	// Set stores a key-value pair in the cache
 	Set(key []byte, value V) error
@@ -47,9 +62,10 @@ type Cache[V any] interface {
 	// Stats returns cache statistics
 	Stats() Stats
 
-	// Scan iterates through all keys with the given prefix and calls the function for each key and value
+	// Scan iterates through all keys and calls the function for each key and value
 	// The function should return true to stop iteration, false to continue
-	Scan(fn func(key []byte, value V) bool) error
+	// Values are passed as pointers to allow pooling/reuse by the implementation
+	Scan(fn func(key []byte, value *V) bool) error
 
 	// Close cleanly shuts down the cache, flushing any pending writes and releasing resources
 	// After Close is called, any subsequent operations will return ErrCacheClosed
@@ -78,24 +94,83 @@ type Stats struct {
 // Use this when you want to store raw bytes without any encoding
 type ByteSliceMarshaler struct{}
 
-func (ByteSliceMarshaler) Marshal(value []byte) ([]byte, error) {
-	return value, nil
+func (ByteSliceMarshaler) Marshal(value []byte, dst []byte) ([]byte, error) {
+	// Grow dst if needed
+	if cap(dst) < len(value) {
+		dst = make([]byte, len(value))
+	} else {
+		dst = dst[:len(value)]
+	}
+	copy(dst, value)
+	return dst, nil
 }
 
-func (ByteSliceMarshaler) Unmarshal(data []byte) ([]byte, error) {
-	return data, nil
+func (ByteSliceMarshaler) Unmarshal(data []byte, target *[]byte) error {
+	*target = data // Just point to existing data (caller should copy if needed)
+	return nil
+}
+
+func (ByteSliceMarshaler) MarshalSize(value []byte) int {
+	return len(value)
 }
 
 // JSONMarshaler marshals values using JSON encoding
 // This is useful for storing structs or other Go types
 type JSONMarshaler[V any] struct{}
 
-func (JSONMarshaler[V]) Marshal(value V) ([]byte, error) {
-	return json.Marshal(value)
+func (JSONMarshaler[V]) Marshal(value V, dst []byte) ([]byte, error) {
+	// Try to marshal directly, falling back to allocation if needed
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reuse dst buffer if it has sufficient capacity
+	if cap(dst) >= len(data) {
+		dst = dst[:len(data)]
+		copy(dst, data)
+		return dst, nil
+	}
+
+	return data, nil
 }
 
-func (JSONMarshaler[V]) Unmarshal(data []byte) (V, error) {
-	var value V
-	err := json.Unmarshal(data, &value)
-	return value, err
+func (JSONMarshaler[V]) Unmarshal(data []byte, target *V) error {
+	return json.Unmarshal(data, target)
+}
+
+func (JSONMarshaler[V]) MarshalSize(value V) int {
+	// JSON doesn't have predictable size without marshaling
+	return -1
+}
+
+// BufferPool manages reusable byte buffers for marshaling operations
+type BufferPool struct {
+	pool sync.Pool
+}
+
+// NewBufferPool creates a new buffer pool with the specified initial size
+func NewBufferPool(initialSize int) *BufferPool {
+	return &BufferPool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, 0, initialSize)
+			},
+		},
+	}
+}
+
+// Get retrieves a buffer from the pool, resetting its length to 0
+func (p *BufferPool) Get() []byte {
+	buf := p.pool.Get().([]byte)
+	return buf[:0] // Reset length but keep capacity
+}
+
+// Put returns a buffer to the pool
+// Extremely large buffers are discarded to prevent memory bloat
+func (p *BufferPool) Put(buf []byte) {
+	const maxBufferSize = 1024 * 1024 // 1MB
+	if cap(buf) < maxBufferSize {
+		p.pool.Put(buf)
+	}
 }

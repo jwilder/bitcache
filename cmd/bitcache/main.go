@@ -462,9 +462,9 @@ var scanCmd = &cobra.Command{
 
 		count := 0
 		deletedCount := 0
-		err := cache.Scan(func(key []byte, value []byte) bool {
+		err := cache.Scan(func(key []byte, value *[]byte) bool {
 			deleted := "no"
-			if value == nil {
+			if value == nil || *value == nil {
 				deleted = "yes"
 				deletedCount++
 			}
@@ -591,7 +591,7 @@ var replCmd = &cobra.Command{
 		fmt.Println("Type 'help' for available commands, 'exit' or 'quit' to exit")
 		fmt.Println()
 
-		cache.Scan(func(key []byte, value []byte) bool {
+		cache.Scan(func(key []byte, value *[]byte) bool {
 			// Warmup: just accessing the keys is enough
 			return false
 		})
@@ -679,7 +679,7 @@ var replCmd = &cobra.Command{
 
 			case "scan":
 				count := 0
-				err := cache.Scan(func(key []byte, value []byte) bool {
+				err := cache.Scan(func(key []byte, value *[]byte) bool {
 					fmt.Printf("%s\n", string(key))
 					count++
 					return false // continue iteration

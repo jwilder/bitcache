@@ -318,7 +318,6 @@ func (s *cacheShard[V]) tryCache(keyHash uint64, key []byte, value V) {
 
 	// Check if entry exceeds max value size limit
 	if s.memCache.config.MaxValueSize > 0 && valueSize > s.memCache.config.MaxValueSize {
-		println("skip too big")
 		return // Don't cache values that are too large
 	}
 
@@ -366,7 +365,6 @@ func (s *cacheShard[V]) tryCache(keyHash uint64, key []byte, value V) {
 
 		if !evicted {
 			// Cannot make room, don't cache this entry
-			println("no room")
 			return
 		}
 		// Retry reservation after eviction
@@ -542,11 +540,40 @@ func (mc *MemCache[V]) Get(key []byte) (V, error) {
 		return zero, err
 	}
 
-	println("cache miss")
 	// Try to cache the result if policy allows
 	shard.tryCache(keyHash, key, value)
 
 	return value, nil
+}
+
+// GetInto retrieves a value from the cache into the provided target
+// This allows the caller to reuse/pool V objects to avoid allocations
+func (mc *MemCache[V]) GetInto(key []byte, target *V) error {
+	if mc.closed.Load() {
+		return ErrCacheClosed
+	}
+
+	keyHash := hashKey(key)
+	shard := mc.getShard(keyHash)
+
+	// Try memory cache first
+	if value, found := shard.get(keyHash); found {
+		mc.hits.Add(1)
+		*target = value
+		return nil
+	}
+
+	// Cache miss - read from backing store
+	mc.misses.Add(1)
+	err := mc.backing.GetInto(key, target)
+	if err != nil {
+		return err
+	}
+
+	// Try to cache the result if policy allows
+	shard.tryCache(keyHash, key, *target)
+
+	return nil
 }
 
 // Set writes a value to the cache
@@ -641,16 +668,16 @@ func (mc *MemCache[V]) Stats() Stats {
 }
 
 // Scan iterates through all keys in the backing cache
-func (mc *MemCache[V]) Scan(fn func(key []byte, value V) bool) error {
+func (mc *MemCache[V]) Scan(fn func(key []byte, value *V) bool) error {
 	if mc.closed.Load() {
 		return ErrCacheClosed
 	}
-	return mc.backing.Scan(func(key []byte, value V) bool {
+	return mc.backing.Scan(func(key []byte, value *V) bool {
 		keyHash := hashKey(key)
 		shard := mc.getShard(keyHash)
 
-		// Try to cache in memory if policy allows
-		shard.tryCache(keyHash, key, value)
+		// Try to cache in memory if policy allows (dereference for caching)
+		shard.tryCache(keyHash, key, *value)
 
 		return fn(key, value)
 	})
