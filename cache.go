@@ -52,20 +52,11 @@ type Cache[V any] interface {
 		Value V
 	}) error
 
-	// Delete removes a key from the cache
-	// Returns ErrKeyNotFound if the key doesn't exist
-	Delete(key []byte) error
-
 	// Has checks if a key exists in the cache
 	Has(key []byte) bool
 
 	// Stats returns cache statistics
 	Stats() Stats
-
-	// Scan iterates through all keys and calls the function for each key and value
-	// The function should return true to stop iteration, false to continue
-	// Values are passed as pointers to allow pooling/reuse by the implementation
-	Scan(fn func(key []byte, value *V) bool) error
 
 	// Close cleanly shuts down the cache, flushing any pending writes and releasing resources
 	// After Close is called, any subsequent operations will return ErrCacheClosed

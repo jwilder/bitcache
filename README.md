@@ -4,26 +4,25 @@ A simple, fast persistent cache in Go library, inspired by the Bitcask design.
 
 ## Features
 
-- **Fast**: O(log n) lookups with in-memory B-tree index
+- **Fast**: O(1) average time complexity for lookups with an in-memory partitioned hash map index
 - **Memory Cache Layer**: Optional high-performance read-through cache with bounded memory
 - **Reliable**: CRC32 checksums for data integrity
-- **Crash-safe**: Hint files enable fast recovery
-- **LSM-Style Compaction**: Multi-level compaction for efficient storage organization
-- **Garbage Collection**: Periodic GC to reclaim space from dead data
-- **Concurrent**: Lock-free reads via atomic B-tree
-- **Zero GC Overhead**: Memory cache uses arenas to eliminate GC pressure
+- **Crash-safe**: Recovers from corrupted files by skipping bad entries with CRC validation
+- **Compaction**: Reclaims disk space by removing old segments based on age and disk usage limits
+- **Concurrent**: Concurrent reads and writes with partitioned locks to minimize contention
+- **Low GC Pressure**: Memory cache uses object pooling to reduce allocations
 - **Simple**: Clean API with minimal dependencies
+- **Write-once**: Keys can be written multiple times but old values are never updated in place
 
 ## Design
 
-BitCache uses a log-structured storage approach inspired by Bitcask with LSM-tree enhancements:
+BitCache uses a log-structured storage approach inspired by Bitcask:
 
 - **Append-only log**: All writes go sequentially to an active segment file. When it reaches the size threshold, it's rotated and a new segment is created.
-- **In-memory index**: A B-tree maps every key to its disk location, enabling O(log n) lookups and efficient sorted iteration.
-- **LSM-style multi-level compaction**: Segments are organized into levels (L0-L4). As segments accumulate at lower levels, they're compacted into higher levels, reducing write amplification and improving read performance.
-- **Garbage collection**: Periodic GC scans segments for dead data (outdated or deleted entries) and rewrites only live entries, reclaiming disk space.
-- **Memory cache layer**: Optional read-through cache using sharded hash maps with LRU/LFU eviction and zero-GC memory arenas.
-- **Crash recovery**: On startup, hint files (embedded segment indexes) allow rebuilding the key directory without scanning the entire log.
+- **In-memory index**: A partitioned hash map (slice of maps keyed by segment ID, then by key) enables O(1) average time lookups and concurrent access without a global lock. Keys are hashed to determine which partition they belong to.
+- **Compaction**: Removes old segments based on age (MaxAge) and/or disk usage limits (MaxDiskUsage). When a segment is removed, all its keys are evicted from the in-memory index by deleting the entire partition map for that segment.
+- **Memory cache layer**: Optional read-through cache using sharded hash maps with LRU/LFU eviction and object pooling to reduce GC pressure.
+- **Crash recovery**: On startup, the key directory is rebuilt by scanning log files. Corrupted entries are detected via CRC validation and skipped to recover as much data as possible.
 
 ## Installation
 
@@ -71,29 +70,14 @@ func main() {
         fmt.Println("Key exists!")
     }
     
-    // Delete a key
-    err = db.Delete([]byte("hello"))
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    // Scan keys with a prefix
-    err = db.Scan([]byte("user:"), func(key []byte) bool {
-        fmt.Printf("Found key: %s\n", key)
-        return false // continue iteration
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    
     // Get statistics
     stats := db.Stats()
     fmt.Printf("Keys: %d\n", stats.Keys)
     fmt.Printf("Data size: %d bytes\n", stats.DataSize)
     fmt.Printf("Reads: %d, Writes: %d\n", stats.Reads, stats.Writes)
     
-    // Compact the database (remove old/deleted entries)
-    err = db.CompactN(0) // 0 = compact all segments
+    // Compact the database to reclaim space
+    err = db.Compact()
     if err != nil {
         log.Fatal(err)
     }
@@ -102,7 +86,7 @@ func main() {
 
 ### Using MemCache Layer
 
-MemCache provides a high-performance read-through cache on top of DiskCache with bounded memory usage and zero GC overhead.
+MemCache provides a high-performance read-through cache on top of DiskCache with bounded memory usage and low GC pressure through object pooling.
 
 #### Basic MemCache Setup
 
@@ -277,55 +261,6 @@ efficiency := float64(stats.MemoryUsed) / float64(stats.MemoryAllocated) * 100
 fmt.Printf("Efficiency: %.2f%%\n", efficiency)
 ```
 
-### Command-Line Interface
-
-BitCache includes a CLI tool for interactive use and benchmarking.
-
-#### Build the CLI
-
-```bash
-cd cmd/bitcache
-go build
-```
-
-#### Basic Operations
-
-```bash
-# Set a key
-./bitcache -d /tmp/mydb set mykey myvalue
-
-# Get a key
-./bitcache -d /tmp/mydb get mykey
-
-# Delete a key
-./bitcache -d /tmp/mydb del mykey
-
-# Scan all keys
-./bitcache -d /tmp/mydb scan
-
-# Scan keys with prefix
-./bitcache -d /tmp/mydb scan --prefix "user:"
-
-# View statistics
-./bitcache -d /tmp/mydb stats
-
-# Compact database (automatic LSM or GC as needed)
-./bitcache -d /tmp/mydb compact
-
-# List segments by level
-./bitcache -d /tmp/mydb compact --list
-
-# Perform garbage collection
-./bitcache -d /tmp/mydb compact --gc
-
-# Compact specific level
-./bitcache -d /tmp/mydb compact --level 0 --batch 4
-
-
-# Dry-run to see what would be compacted
-./bitcache -d /tmp/mydb compact --level 0 --dry-run
-```
-
 ## Performance
 
 Benchmarks run on a MacBook Pro with SSD:
@@ -342,73 +277,9 @@ BenchmarkMemCache/set-10               584,257  2,052.00 ns/op  144 B/op    3 al
 
 - **Cached reads**: ~42 ns/op with zero allocations
 - **Cache misses**: Falls back to disk with automatic caching
-- **Zero GC overhead**: Memory arenas eliminate GC pressure
+- **Low GC pressure**: Object pooling reduces allocations
 
-### Write Performance
 
-```
-$ ./bitcache -d /tmp/bench bench --op write --keys 10000 --total 100000 --key-size 16 --value-size 128
-
-Running write benchmark...
-Configuration:
-  Keys: 10000
-  Key size: 16 bytes
-  Value size: 128 bytes
-  Total writes: 100000
-
-=== Write Benchmark Results ===
-Total writes: 100000
-Unique keys: 10000
-Duration: 221ms
-Throughput: 452,463 ops/sec
-Average latency: 2.21µs
-Data written: 13.73 MB
-Data throughput: 62.14 MB/sec
-```
-
-### Read Performance
-
-```
-$ ./bitcache -d /tmp/bench bench --op read --keys 10000 --total 100000 --key-size 16 --value-size 128
-
-Running read benchmark...
-Configuration:
-  Keys: 10000
-  Key size: 16 bytes
-  Value size: 128 bytes
-  Total reads: 100000
-
-=== Read Benchmark Results ===
-Total reads: 100000
-Successful reads: 100000
-Unique keys: 10000
-Duration: 210ms
-Throughput: 476,924 ops/sec
-Average latency: 2.09µs
-Data read: 13.73 MB
-Data throughput: 65.50 MB/sec
-```
-
-### Custom Benchmarks
-
-```bash
-# Write benchmark with custom parameters
-./bitcache -d /tmp/bench bench --op write \
-  --keys 100000 \
-  --total 1000000 \
-  --key-size 32 \
-  --value-size 256
-
-# Read benchmark
-./bitcache -d /tmp/bench bench --op read \
-  --keys 100000 \
-  --total 1000000 \
-  --key-size 32 \
-  --value-size 256
-
-# Verify data integrity after benchmark
-./bitcache -d /tmp/bench verify --keys 100000 --key-size 32 --value-size 256
-```
 
 ## API Reference
 
@@ -423,18 +294,11 @@ type Cache interface {
     // Set stores a key-value pair in the cache
     Set(key []byte, value []byte) error
 
-    // Delete removes a key from the cache
-    Delete(key []byte) error
-
     // Has checks if a key exists in the cache
     Has(key []byte) bool
 
     // Stats returns cache statistics
     Stats() Stats
-
-    // Scan iterates through all keys with the given prefix
-    // The callback function should return true to stop iteration
-    Scan(prefix []byte, fn func(key []byte) bool) error
 }
 ```
 
@@ -503,8 +367,8 @@ func (mc *MemCache) Compact() error
 // Close cleanly shuts down the database
 func (d *DiskCache) Close() error
 
-// CompactN compacts the oldest N segments (0 = all segments)
-func (d *DiskCache) CompactN(count int) error
+// Compact removes old segments based on configured age and disk usage limits
+func (d *DiskCache) Compact() error
 
 // Sync forces a fsync on the active segment
 func (d *DiskCache) Sync() error
@@ -520,7 +384,6 @@ type Stats struct {
     Segments  int    // Number of segment files
     Reads     int64  // Total number of read operations
     Writes    int64  // Total number of write operations
-    Deletes   int64  // Total number of delete operations
 }
 ```
 
@@ -546,28 +409,45 @@ if err == bitcache.ErrCacheClosed {
 
 ## Configuration
 
-BitCache uses sensible defaults:
+BitCache uses sensible defaults, but can be configured:
 
-- **Max segment size**: 16 MB (rotates to new segment when reached)
-- **File caching**: All segment files are cached once opened (no eviction)
-- **Sync policy**: Automatic fsync on segment rotation
+```go
+config := bitcache.DiskCacheConfig{
+    MaxSegmentSize:      16 * 1024 * 1024,  // 16 MB (default)
+    MaxDiskUsage:        1024 * 1024 * 1024, // 1 GB limit (0 = no limit)
+    MinSegmentAge:       time.Hour,          // Don't remove segments newer than 1 hour
+    AutoCompactEnabled:  true,               // Enable automatic compaction
+    AutoCompactInterval: 5 * time.Minute,    // Check every 5 minutes
+    AutoCompactMaxAge:   7 * 24 * time.Hour, // Remove segments older than 7 days
+}
+db, err := bitcache.NewDiskCacheWithConfig("/path/to/data", config)
+```
+
+**Configuration Options:**
+
+- **MaxSegmentSize**: Maximum size before rotating to a new segment file (default: 16 MB)
+- **MaxDiskUsage**: Maximum total disk usage before compaction removes old segments (default: 0 = no limit)
+- **MinSegmentAge**: Minimum age before a segment can be removed (default: 1 hour)
+- **AutoCompactEnabled**: Enable automatic background compaction (default: false)
+- **AutoCompactInterval**: Time between automatic compaction checks (default: 5 minutes)
+- **AutoCompactMaxAge**: Maximum age for segments; older segments are removed (default: 0 = age-based removal disabled)
 
 ### MemCache Architecture
 
-MemCache provides zero-GC overhead through a custom memory arena allocator:
+MemCache provides low GC pressure through object pooling and careful memory management:
 
-**How Zero-GC Works:**
+**How Object Pooling Works:**
 
-1. **Large Slab Allocation**: Allocates large byte slices (power-of-2 sizes: 1MB, 2MB, 4MB, 8MB, 16MB, 32MB) upfront
-2. **Sub-Allocation**: Keys and values are carved out of these slabs
-3. **No Individual Allocations**: After initial slab allocation, no new allocations occur
-4. **GC Friendly**: Large slabs are invisible to GC, preventing scanning overhead
+1. **Entry Pooling**: Uses `sync.Pool` to reuse cache entry objects, avoiding repeated allocations
+2. **Node Pooling**: LRU list nodes are pooled and reused when entries are evicted
+3. **Bounded Memory**: Strict memory limit with automatic eviction prevents unbounded growth
+4. **Sharded Maps**: Distributes entries across multiple shards to reduce lock contention
 
 **Memory Accounting:**
 
 Each cached entry consumes:
 - Key size (bytes)
-- Value size (bytes)  
+- Value size (bytes)
 - ~32 bytes overhead (entry metadata)
 
 The memory limit is strictly enforced - entries are evicted before exceeding the limit.
@@ -592,10 +472,9 @@ BitCache is primarily designed for **persistent caching** scenarios:
 As a persistent cache rather than a full storage engine, BitCache has intentional trade-offs:
 
 - Single writer at a time (concurrent reads are fully supported)
-- **Prototyping**: Quick storage solution for proof-of-concepts
-- **Embedded databases**: Simple key-value storage within applications
+- No delete operations (write-once keys with automatic age-based eviction)
 - No query language or secondary indexes
-- Compaction requires temporarily holding data in memory
+- No transactions or batch operations
 
 These limitations make it unsuitable as a primary database for most applications, but ideal for caching scenarios.
 
@@ -610,8 +489,9 @@ These limitations make it unsuitable as a primary database for most applications
 
 ## Limitations
 
-- All keys must fit in memory (values are on disk) with efficient B-tree storage
+- All keys must fit in memory (values are on disk)
 - Single writer (concurrent reads are supported)
+- No delete operations (use age-based or size-based compaction instead)
 - No transactions or batch operations
 - No built-in replication or clustering
 
@@ -626,4 +506,3 @@ MIT License - see [LICENSE](LICENSE) file for details.
 ## Acknowledgments
 
 - Inspired by the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) paper
-- Uses [tidwall/btree](https://github.com/tidwall/btree) for the in-memory index

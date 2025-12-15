@@ -51,21 +51,6 @@ func TestMemCache_BasicOperations(t *testing.T) {
 	if !memCache.Has(key) {
 		t.Error("Has returned false for existing key")
 	}
-
-	// Test Delete
-	err = memCache.Delete(key)
-	if err != nil {
-		t.Fatalf("Delete failed: %v", err)
-	}
-
-	if memCache.Has(key) {
-		t.Error("Has returned true for deleted key")
-	}
-
-	_, err = memCache.Get(key)
-	if err != ErrKeyNotFound {
-		t.Errorf("Expected ErrKeyNotFound, got %v", err)
-	}
 }
 
 func TestMemCache_ReadThrough(t *testing.T) {
@@ -903,13 +888,6 @@ func TestMemCacheStats(t *testing.T) {
 		if err := mc.Set(key, value); err != nil {
 			t.Fatalf("Failed to set: %v", err)
 		}
-	}
-
-	// Phase 5: Delete some keys
-	fmt.Println("\nPhase 5: Deleting 5 keys...")
-	for i := 0; i < 5; i++ {
-		key := []byte(fmt.Sprintf("key-%03d", i))
-		mc.Delete(key)
 	}
 
 	// Get stats

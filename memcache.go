@@ -624,23 +624,6 @@ func (mc *MemCache[V]) BatchSet(entries []struct {
 	return nil
 }
 
-// Delete removes a key from both memory and backing cache
-func (mc *MemCache[V]) Delete(key []byte) error {
-	if mc.closed.Load() {
-		return ErrCacheClosed
-	}
-
-	// Delete from backing store first
-	err := mc.backing.Delete(key)
-
-	// Remove from memory cache regardless of backing store result
-	keyHash := hashKey(key)
-	shard := mc.getShard(keyHash)
-	shard.delete(keyHash)
-
-	return err
-}
-
 // Has checks if a key exists in either memory or backing cache
 func (mc *MemCache[V]) Has(key []byte) bool {
 	if mc.closed.Load() {
@@ -665,22 +648,6 @@ func (mc *MemCache[V]) Stats() Stats {
 
 	// Return backing stats as-is
 	return backingStats
-}
-
-// Scan iterates through all keys in the backing cache
-func (mc *MemCache[V]) Scan(fn func(key []byte, value *V) bool) error {
-	if mc.closed.Load() {
-		return ErrCacheClosed
-	}
-	return mc.backing.Scan(func(key []byte, value *V) bool {
-		keyHash := hashKey(key)
-		shard := mc.getShard(keyHash)
-
-		// Try to cache in memory if policy allows (dereference for caching)
-		shard.tryCache(keyHash, key, *value)
-
-		return fn(key, value)
-	})
 }
 
 // MemStats returns memory-specific statistics
